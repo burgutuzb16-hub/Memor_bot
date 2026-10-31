@@ -1,7 +1,9 @@
 import os
 import time
+import re
 import logging
 import threading
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 
@@ -24,12 +26,32 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
+# Asosiy Menyu
 MAIN_KEYBOARD = {
     "keyboard": [
         [{"text": "📦 Xomashyo & Qoplar"}, {"text": "🏭 Ostatka (Ishlab chiqarish)"}],
         [{"text": "💰 Kassa Balansi"}, {"text": "📒 Sotuv Daftari"}],
         [{"text": "👥 Qarzdor Mijozlar"}, {"text": "👨‍🔧 Ishchilar Oyligi"}],
         [{"text": "🎁 Bonuslar Tahlili"}],
+    ],
+    "resize_keyboard": True,
+}
+
+# Kassa uchun sana va amallar menyusi
+KASSA_DATE_KEYBOARD = {
+    "keyboard": [
+        [{"text": "💵 Umumiy Balans"}, {"text": "💰 Bugungi Kassa"}],
+        [{"text": "💰 Kechagi Kassa"}, {"text": "🧾 Oxirgi 10 ta Kassa amali"}],
+        [{"text": "🔙 Asosiy Menyu"}],
+    ],
+    "resize_keyboard": True,
+}
+
+# Sotuv daftari menyusi
+SALES_DATE_KEYBOARD = {
+    "keyboard": [
+        [{"text": "🗓 Bugungi sotuvlar"}, {"text": "🗓 Kechagi sotuvlar"}],
+        [{"text": "🗓 Oxirgi 10 ta savdo"}, {"text": "🔙 Asosiy Menyu"}],
     ],
     "resize_keyboard": True,
 }
@@ -65,17 +87,112 @@ def send_message(chat_id: int, text: str, reply_markup=None):
     except Exception as e:
         logging.error(f"Xabar yuborishda xatolik: {e}")
 
+def get_debts_dict():
+    url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=debt,customers(name,phone)"
+    res = requests.get(url, headers=HEADERS, timeout=10)
+    rows = res.json() if isinstance(res.json(), list) else []
+
+    customers_data = {}
+    for r in rows:
+        c = r.get("customers")
+        if not c:
+            continue
+        c_name = (c.get("name") or "Noma'lum").strip()
+        c_phone = (c.get("phone") or "").strip()
+        debt_val = float(r.get("debt") or 0)
+
+        if c_name not in customers_data:
+            customers_data[c_name] = {"phone": c_phone, "total_debt": 0.0}
+        customers_data[c_name]["total_debt"] += debt_val
+
+    return {k: v for k, v in customers_data.items() if v["total_debt"] > 0}
+
+# ----------------- KASSA FUNKSIYALARI -----------------
+def fetch_kassa_by_date(date_str: str):
+    url = f"{SUPABASE_URL}/rest/v1/kassa?date=eq.{date_str}&select=type,amount,comment,category,date&order=id.desc"
+    res = requests.get(url, headers=HEADERS, timeout=10)
+    return res.json() if isinstance(res.json(), list) else []
+
+def format_kassa_response(rows: list, title: str) -> str:
+    kirim = sum(float(r.get("amount") or 0) for r in rows if r.get("type") == "kirim")
+    chiqim = sum(float(r.get("amount") or 0) for r in rows if r.get("type") == "chiqim")
+    sof_foyda = kirim - chiqim
+
+    msg = f"{title}\n\n"
+    msg += f"🟢 Jami Kirim: <b>+{kirim:,.0f} so'm</b>\n"
+    msg += f"🔴 Jami Chiqim: <b>-{chiqim:,.0f} so'm</b>\n"
+    msg += f"💵 Kunlik Sof Qoldiq: <b>{sof_foyda:,.0f} so'm</b>\n"
+    msg += "═" * 22 + "\n\n"
+
+    if not rows:
+        msg += "<i>Ushbu sanada kassa harakatlari amalga oshirilmagan.</i>"
+        return msg
+
+    msg += "<b>Batafsil amallar:</b>\n"
+    for i, r in enumerate(rows, 1):
+        t = "🟢 Kirim" if r.get("type") == "kirim" else "🔴 Chiqim"
+        amt = float(r.get("amount") or 0)
+        comment = r.get("comment") or r.get("category") or "Izohsiz"
+        msg += f"{i}. {t}: <b>{amt:,.0f} so'm</b>\n   └ <i>{comment}</i>\n"
+
+    return msg
+
+# ----------------- SOTUV FUNKSIYALARI -----------------
+def fetch_sales_by_date(date_str: str):
+    url = (
+        f"{SUPABASE_URL}/rest/v1/customer_sales?"
+        f"select=product_name,quantity,price,total,paid,debt,date,customers(name)"
+        f"&date=eq.{date_str}&is_ostatka=eq.false&order=id.desc"
+    )
+    res = requests.get(url, headers=HEADERS, timeout=10)
+    return res.json() if isinstance(res.json(), list) else []
+
+def format_sales_response(sales: list, title: str) -> str:
+    if not sales:
+        return f"{title}\n\n❌ Bu sanada hech qanday sotuv amalga oshirilmagan."
+
+    total_sum = sum(float(s.get("total") or 0) for s in sales)
+    total_qty = sum(float(s.get("quantity") or 0) for s in sales)
+    total_paid = sum(float(s.get("paid") or 0) for s in sales)
+
+    msg = f"{title}\n"
+    msg += f"📦 Jami hajm: <b>{total_qty:,.0f} dona</b>\n"
+    msg += f"💵 Jami summa: <b>{total_sum:,.0f} so'm</b>\n"
+    msg += f"🟢 To'langan: <b>{total_paid:,.0f} so'm</b>\n"
+    msg += "═" * 22 + "\n\n"
+
+    for i, s in enumerate(sales, 1):
+        c_name = s.get("customers", {}).get("name") if s.get("customers") else "Mijoz"
+        p_name = s.get("product_name") or "Mahsulot"
+        qty = float(s.get("quantity") or 0)
+        tot = float(s.get("total") or 0)
+        paid = float(s.get("paid") or 0)
+        debt = float(s.get("debt") or 0)
+
+        msg += (
+            f"<b>{i}. {c_name}</b>\n"
+            f"   📦 {p_name}: {qty:,.0f} dona ({tot:,.0f} so'm)\n"
+            f"   💳 To'landi: {paid:,.0f} so'm"
+        )
+        if debt > 0:
+            msg += f" | 🔴 Qarz: {debt:,.0f} so'm"
+        msg += "\n\n"
+
+    return msg
+
+# ----------------- XABARLARNI QAYTA ISHLASH -----------------
 def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
     if not is_admin(user_id):
         send_message(chat_id, f"Salom! Siz tizimda ro'yxatdan o'tmagansiz (Telegram ID: {user_id}).")
         return
 
-    if text in ["/start", "start"]:
+    # Asosiy Menyu
+    if text in ["/start", "start", "🔙 Asosiy Menyu"]:
         send_message(
             chat_id,
             f"Assalomu alaykum, <b>{first_name}</b>!\n"
-            "Memor ERP boshqaruv paneliga xush kelibsiz.\n"
-            "Bo'limni tanlang:",
+            "Memor ERP boshqaruv tizimi boti faol.\n\n"
+            "💡 <i>Istalgan sanadagi kassa va sotuvlarni ko'rish uchun sanani yozib yuboring (Masalan: 2026-10-19).</i>",
             reply_markup=MAIN_KEYBOARD,
         )
 
@@ -103,7 +220,6 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         try:
             p_res = requests.get(f"{SUPABASE_URL}/rest/v1/production?select=quantity", headers=HEADERS, timeout=10)
             s_res = requests.get(f"{SUPABASE_URL}/rest/v1/customer_sales?select=quantity&is_ostatka=eq.false", headers=HEADERS, timeout=10)
-            
             p_data = p_res.json() if isinstance(p_res.json(), list) else []
             s_data = s_res.json() if isinstance(s_res.json(), list) else []
 
@@ -121,8 +237,16 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    # 3. KASSA
+    # 3. KASSA BALANSI BOSILGANDA
     elif text == "💰 Kassa Balansi":
+        send_message(
+            chat_id,
+            "💰 <b>Kassa bo'limi</b>\n\n"
+            "Kerakli bandni tanlang yoki ma'lum bir sanani yozib yuboring (Masalan: <code>2026-10-19</code>):",
+            reply_markup=KASSA_DATE_KEYBOARD,
+        )
+
+    elif text == "💵 Umumiy Balans":
         try:
             url = f"{SUPABASE_URL}/rest/v1/kassa?select=type,amount"
             res = requests.get(url, headers=HEADERS, timeout=10)
@@ -133,94 +257,109 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
             qoldiq = kirim - chiqim
 
             msg = (
-                "💰 <b>Kassa & Balans:</b>\n\n"
+                "💰 <b>Umumiy Kassa Balansi:</b>\n\n"
                 f"🟢 Jami Kirim: <b>{kirim:,.0f} so'm</b>\n"
                 f"🔴 Jami Chiqim: <b>{chiqim:,.0f} so'm</b>\n"
-                f"💵 <b>Hozirgi Kassa Qoldig'i: {qoldiq:,.0f} so'm</b>"
+                f"💵 <b>Hozirgi Naqd Qoldiq: {qoldiq:,.0f} so'm</b>"
             )
-            send_message(chat_id, msg)
+            send_message(chat_id, msg, reply_markup=KASSA_DATE_KEYBOARD)
+        except Exception as e:
+            send_message(chat_id, f"Xatolik: {e}")
+
+    elif text == "💰 Bugungi Kassa":
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        rows = fetch_kassa_by_date(today_str)
+        msg = format_kassa_response(rows, f"💰 <b>Bugungi Kassa Hisoboti ({today_str})</b>")
+        send_message(chat_id, msg, reply_markup=KASSA_DATE_KEYBOARD)
+
+    elif text == "💰 Kechagi Kassa":
+        yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        rows = fetch_kassa_by_date(yesterday_str)
+        msg = format_kassa_response(rows, f"💰 <b>Kechagi Kassa Hisoboti ({yesterday_str})</b>")
+        send_message(chat_id, msg, reply_markup=KASSA_DATE_KEYBOARD)
+
+    elif text == "🧾 Oxirgi 10 ta Kassa amali":
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/kassa?select=type,amount,comment,category,date&order=id.desc&limit=10"
+            res = requests.get(url, headers=HEADERS, timeout=10)
+            rows = res.json() if isinstance(res.json(), list) else []
+            msg = "🧾 <b>Oxirgi 10 ta Kassa Amaliyoti:</b>\n\n"
+            for r in rows:
+                t = "🟢 Kirim" if r.get("type") == "kirim" else "🔴 Chiqim"
+                amt = float(r.get("amount") or 0)
+                d = r.get("date") or ""
+                comm = r.get("comment") or r.get("category") or "Izohsiz"
+                msg += f"• [{d}] {t}: <b>{amt:,.0f} so'm</b>\n   └ <i>{comm}</i>\n"
+            send_message(chat_id, msg, reply_markup=KASSA_DATE_KEYBOARD)
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
     # 4. SOTUV DAFTARI
     elif text == "📒 Sotuv Daftari":
+        send_message(
+            chat_id,
+            "📒 <b>Sotuv Daftari bo'limi</b>\n\n"
+            "Kerakli bandni tanlang yoki xohlagan sanangizni yozib yuboring:\n"
+            "Misol: <code>2026-10-19</code> yoki <code>19.10.2026</code>",
+            reply_markup=SALES_DATE_KEYBOARD,
+        )
+
+    elif text == "🗓 Bugungi sotuvlar":
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        sales = fetch_sales_by_date(today_str)
+        msg = format_sales_response(sales, f"🗓 <b>Bugungi sotuvlar ({today_str}):</b>")
+        send_message(chat_id, msg, reply_markup=SALES_DATE_KEYBOARD)
+
+    elif text == "🗓 Kechagi sotuvlar":
+        yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        sales = fetch_sales_by_date(yesterday_str)
+        msg = format_sales_response(sales, f"🗓 <b>Kechagi sotuvlar ({yesterday_str}):</b>")
+        send_message(chat_id, msg, reply_markup=SALES_DATE_KEYBOARD)
+
+    elif text == "🗓 Oxirgi 10 ta savdo":
         try:
-            url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=product_name,quantity,total,paid,date,customers(name)&is_ostatka=eq.false&order=id.desc&limit=8"
+            url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=product_name,quantity,total,paid,debt,date,customers(name)&is_ostatka=eq.false&order=id.desc&limit=10"
             res = requests.get(url, headers=HEADERS, timeout=10)
             sales = res.json() if isinstance(res.json(), list) else []
-
-            if not sales:
-                send_message(chat_id, "Sotuv daftari bo'sh.")
-                return
-
-            msg = "📒 <b>Oxirgi Sotuvlar Jurnali:</b>\n\n"
-            for s in sales:
-                c_name = s.get("customers", {}).get("name") if s.get("customers") else "Mijoz"
-                msg += (
-                    f"🗓 <b>{s.get('date')}</b> | 👤 <b>{c_name}</b>\n"
-                    f"📦 {s.get('product_name')}: {s.get('quantity')} ta = {float(s.get('total') or 0):,.0f} so'm\n"
-                    f"💵 To'landi: {float(s.get('paid') or 0):,.0f} so'm\n"
-                    f"--------------------\n"
-                )
-            send_message(chat_id, msg)
+            msg = format_sales_response(sales, "📒 <b>Oxirgi 10 ta savdo amaliyoti:</b>")
+            send_message(chat_id, msg, reply_markup=SALES_DATE_KEYBOARD)
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    # 5. QARZDOR MIJOZLAR (TUMAN/SHAHAR VA ALIFBO TARTIBIDA)
+    # 5. QARZDOR MIJOZLAR
     elif text == "👥 Qarzdor Mijozlar":
         try:
-            # Mijozlar va ularning qarzlari hamda qaysi tumandagi (folder) ekanligini olamiz
-            url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=debt,customers(name,folder,phone)"
-            res = requests.get(url, headers=HEADERS, timeout=10)
-            rows = res.json() if isinstance(res.json(), list) else []
-
-            # Tumanlar bo'yicha mijozlarning qarzlarini jamlash
-            # Format: { "Kasbi": { "Alimardon": 500000, "Sanjar": 120000 }, "Koson": { ... } }
-            regions = {}
-            total_debt_all = 0
-
-            for r in rows:
-                c = r.get("customers")
-                if not c:
-                    continue
-                
-                c_name = c.get("name", "Noma'lum").strip()
-                folder = (c.get("folder") or "Umumiy").strip()
-                debt_val = float(r.get("debt") or 0)
-
-                if folder not in regions:
-                    regions[folder] = {}
-
-                regions[folder][c_name] = regions[folder].get(c_name, 0) + debt_val
-
-            # Faqat qarzi bor (0 dan katta) mijozlarni saralash
-            filtered_regions = {}
-            for f_name, clients in regions.items():
-                active_clients = {name: d for name, d in clients.items() if d > 0}
-                if active_clients:
-                    filtered_regions[f_name] = active_clients
-                    total_debt_all += sum(active_clients.values())
-
-            if not filtered_regions:
-                send_message(chat_id, "✅ Hozirda qarzdor mijozlar mavjud emas!")
+            active_debts = get_debts_dict()
+            if not active_debts:
+                send_message(chat_id, "✅ Qarzdor mijozlar mavjud emas!")
                 return
 
-            msg = f"👥 <b>QARZDORLAR (HUDUDLAR VA ALIFBO BO'YICHA):</b>\n"
-            msg += f"💵 <b>Umumiy qarz: {total_debt_all:,.0f} so'm</b>\n\n"
+            total_sum = sum(v["total_debt"] for v in active_debts.values())
+            sorted_names = sorted(active_debts.keys(), key=lambda s: s.lower())
 
-            # Tumanlarni alifbo tartibida chiqarish
-            for f_name in sorted(filtered_regions.keys()):
-                clients_in_folder = filtered_regions[f_name]
-                folder_total = sum(clients_in_folder.values())
+            msg = f"👥 <b>QARZDOR MIJOZLAR RO'YXATI</b>\n"
+            msg += f"💵 Jami qarz: <b>{total_sum:,.0f} so'm</b>\n"
+            msg += f"👤 Qarzdorlar soni: <b>{len(sorted_names)} ta</b>\n"
+            msg += "═" * 22 + "\n\n"
 
-                msg += f"📁 <b>{f_name.upper()}</b> (Jami: {folder_total:,.0f} so'm):\n"
-                
-                # Tumandagi mijozlarni Alifbo (A-Z) tartibida saralash
-                for c_name in sorted(clients_in_folder.keys(), key=lambda s: s.lower()):
-                    d_amount = clients_in_folder[c_name]
-                    msg += f"  ▫️ {c_name}: <b>{d_amount:,.0f} so'm</b>\n"
-                
-                msg += "\n"
+            current_char = ""
+            count = 1
+
+            for name in sorted_names:
+                first_char = name[0].upper()
+                if first_char != current_char:
+                    current_char = first_char
+                    msg += f"\n🔤 <b>— [ {current_char} ] —</b>\n"
+
+                info = active_debts[name]
+                debt_str = f"{info['total_debt']:,.0f} so'm"
+                phone_str = f" <i>({info['phone']})</i>" if info['phone'] else ""
+
+                msg += (
+                    f"<b>{count}. {name}</b>{phone_str}\n"
+                    f"    └── 🔴 Qarz: <b>{debt_str}</b>\n"
+                )
+                count += 1
 
             send_message(chat_id, msg)
         except Exception as e:
@@ -265,6 +404,56 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
+    # 8. SANA YOZILGANDA (KASSA VA SOTUVNI BIRGALIKDA CHIQARISH)
+    else:
+        clean_text = text.strip()
+        matched_date = None
+
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", clean_text):
+            matched_date = clean_text
+        elif re.match(r"^\d{2}\.\d{2}\.\d{4}$", clean_text):
+            p = clean_text.split(".")
+            matched_date = f"{p[2]}-{p[1]}-{p[0]}"
+
+        if matched_date:
+            # 1. Kassani olish
+            k_rows = fetch_kassa_by_date(matched_date)
+            k_msg = format_kassa_response(k_rows, f"💰 <b>{matched_date} KASSA HISOBOTI</b>")
+            send_message(chat_id, k_msg)
+
+            # 2. Sotuvlarni olish
+            s_rows = fetch_sales_by_date(matched_date)
+            s_msg = format_sales_response(s_rows, f"🗓 <b>{matched_date} SOTUV HISOBOTI</b>")
+            send_message(chat_id, s_msg)
+            return
+
+        # 9. AGAR SANA BO'LMASA — MIJOZ QIDIRUVI
+        try:
+            query = clean_text.lower()
+            active_debts = get_debts_dict()
+            matched = {k: v for k, v in active_debts.items() if query in k.lower() or query in v["phone"]}
+
+            if matched:
+                msg = f"🔍 <b>'{clean_text}' bo'yicha qidiruv natijalari:</b>\n\n"
+                for name, info in matched.items():
+                    phone = f"\n📞 Tel: {info['phone']}" if info['phone'] else ""
+                    msg += (
+                        f"👤 <b>{name}</b>{phone}\n"
+                        f"💰 Qarzdorlik: <b>{info['total_debt']:,.0f} so'm</b>\n"
+                        f"────────────────────\n"
+                    )
+                send_message(chat_id, msg)
+            else:
+                send_message(
+                    chat_id,
+                    f"🔍 Hech narsa topilmadi.\n\n"
+                    "• Qarzdor qidirish uchun ismini yozing (masalan: <code>Sfera</code>)\n"
+                    "• Istalgan kun kassa/sotuvini ko'rish uchun sanani yozing (masalan: <code>2026-10-19</code>)",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+        except Exception as e:
+            send_message(chat_id, f"Xatolik: {e}")
+
 def main():
     if not BOT_TOKEN:
         logging.error("BOT_TOKEN topilmadi!")
@@ -272,7 +461,7 @@ def main():
 
     threading.Thread(target=start_dummy_server, daemon=True).start()
     logging.info(f"Render veb-porti ({PORT}) ochiq saqlanmoqda...")
-    logging.info("Memor ERP to'liq boti ishga tushdi!")
+    logging.info("Memor ERP boti ishga tushdi!")
     offset = 0
 
     while True:
