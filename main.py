@@ -34,13 +34,16 @@ def get_uz_today() -> datetime:
 
 MAIN_KEYBOARD = {
     "keyboard": [
-        [{"text": "🏭 Korxonalar & Ostatka"}, {"text": "📦 Xomashyo & Qoplar"}],
+        [{"text": "🏭 Ostatka (Retseptlar)"}, {"text": "📦 Xomashyo & Qoplar"}],
         [{"text": "💰 Kassa Balansi"}, {"text": "📒 Sotuv Daftari"}],
-        [{"text": "👥 Qarzdor Mijozlar"}, {"text": "👨‍🔧 Ishchilar Oyligi (Arxiv)"}],
-        [{"text": "🎁 Bonuslar Tahlili"}],
+        [{"text": "👨‍🔧 Ishchilar Oyligi"}, {"text": "👥 Qarzdor Mijozlar"}],
+        [{"text": "🏢 Korxonani Almashtirish"}, {"text": "🎁 Bonuslar"}],
     ],
     "resize_keyboard": True,
 }
+
+# Foydalanuvchining joriy tanlagan korxonasi (chat_id -> branch_id)
+USER_ACTIVE_BRANCH = {}
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -82,154 +85,144 @@ def clean_name(str_val: str) -> str:
         return ""
     return re.sub(r"^[+\-*_]+", "", str_val.split("(")[0]).strip().lower()
 
-# ----------------- 1. KORXONALAR VA OSTATKA (RETSEPTLAR BALANSI) -----------------
-def get_enterprises_report():
+def get_current_branch(chat_id: int):
+    # Agar tanlanmagan bo'lsa, birinchi korxonani oladi
+    b_id = USER_ACTIVE_BRANCH.get(chat_id)
     b_res = requests.get(f"{SUPABASE_URL}/rest/v1/branches?select=*&order=id.asc", headers=HEADERS, timeout=10)
     branches = b_res.json() if isinstance(b_res.json(), list) else []
-
     if not branches:
-        return "🏢 Tizimda korxonalar topilmadi.", None
+        return None, "Korxonalar mavjud emas"
 
+    if not b_id or not any(b.get("id") == b_id for b in branches):
+        b_id = branches[0].get("id")
+        USER_ACTIVE_BRANCH[chat_id] = b_id
+
+    curr = next((b for b in branches if b.get("id") == b_id), branches[0])
+    return curr.get("id"), f"{curr.get('name')} ({curr.get('city')})"
+
+# ----------------- KORXONANI TANLASH -----------------
+def get_branch_selector_keyboard():
+    b_res = requests.get(f"{SUPABASE_URL}/rest/v1/branches?select=*&order=id.asc", headers=HEADERS, timeout=10)
+    branches = b_res.json() if isinstance(b_res.json(), list) else []
     buttons = []
     for b in branches:
-        buttons.append([{"text": f"🏢 {b.get('name')} ({b.get('city')})", "callback_data": f"branch_ost_{b.get('id')}"}])
-    buttons.append([{"text": "📊 Barcha Korxonalar Umumiy Balansi", "callback_data": "branch_ost_all"}])
+        buttons.append([{"text": f"🏢 {b.get('name')} ({b.get('city')})", "callback_data": f"set_br_{b.get('id')}"}])
+    return "🏢 <b>Kerakli korxonani tanlang:</b>", {"inline_keyboard": buttons}
 
-    msg = "🏢 <b>Korxonalar Ostatkasi:</b>\nQaysi korxona bo'yicha mahsulot qoldiqlarini ko'rmoqchisiz?"
-    return msg, {"inline_keyboard": buttons}
+# ----------------- 1. OSTATKA (RETSEPTLAR) -----------------
+def get_production_report(chat_id: int):
+    b_id, b_name = get_current_branch(chat_id)
+    if not b_id:
+        return "Korxona topilmadi."
 
-def get_production_breakdown(branch_id=None):
-    # 01.11.2026 dan keyingi sotuvlar
-    s_url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=product_name,quantity,date&is_ostatka=eq.false&date=gte.{OSTATKA_START_DATE}"
+    # Sotuvlar (01.11.2026 dan)
+    s_url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=product_name,quantity&is_ostatka=eq.false&date=gte.{OSTATKA_START_DATE}"
     s_res = requests.get(s_url, headers=HEADERS, timeout=10)
     sales = s_res.json() if isinstance(s_res.json(), list) else []
 
     sold_map = {}
-    total_sold = 0
     for s in sales:
         c_name = clean_name(s.get("product_name"))
         q = float(s.get("quantity") or 0)
         if c_name:
             sold_map[c_name] = sold_map.get(c_name, 0.0) + q
-            total_sold += q
 
-    # 01.11.2026 dan keyingi ishlab chiqarish
-    p_url = f"{SUPABASE_URL}/rest/v1/production?select=*&date=gte.{OSTATKA_START_DATE}&order=date.desc"
-    if branch_id and branch_id != "all":
-        p_url += f"&branch_id=eq.{branch_id}"
+    # Ishlab chiqarish
+    p_url = f"{SUPABASE_URL}/rest/v1/production?select=*&branch_id=eq.{b_id}&date=gte.{OSTATKA_START_DATE}"
     p_res = requests.get(p_url, headers=HEADERS, timeout=10)
     prods = p_res.json() if isinstance(p_res.json(), list) else []
 
-    # Korxona nomi
-    b_title = "Barcha Korxonalar (Umumiy)"
-    if branch_id and branch_id != "all":
-        br_res = requests.get(f"{SUPABASE_URL}/rest/v1/branches?id=eq.{branch_id}", headers=HEADERS, timeout=10)
-        br_data = br_res.json() if isinstance(br_res.json(), list) else []
-        if br_data:
-            b_title = f"{br_data[0].get('name')} ({br_data[0].get('city')})"
-
     prod_map = {}
-    total_produced = 0
+    tot_p = 0
     for p in prods:
         c_name = clean_name(p.get("recipe_name"))
         q = float(p.get("quantity") or 0)
         if c_name:
             prod_map[c_name] = prod_map.get(c_name, 0.0) + q
-            total_produced += q
+            tot_p += q
 
-    # Retseptlar ro'yxati
     r_res = requests.get(f"{SUPABASE_URL}/rest/v1/recipes?select=name", headers=HEADERS, timeout=10)
     recipes = r_res.json() if isinstance(r_res.json(), list) else []
 
-    all_keys = sorted(list(set(list(prod_map.keys()) + list(sold_map.keys()) + [clean_name(r.get("name")) for r in recipes])))
+    all_keys = sorted(list(set(list(prod_map.keys()) + [clean_name(r.get("name")) for r in recipes])))
 
-    msg = f"🏭 <b>{b_title}</b>\n"
-    msg += f"<i>(01.11.2026 dan boshlab hisoblangan)</i>\n"
-    msg += f"🟢 Jami Ishlab Chiqarildi: <b>{total_produced:,.0f} qop</b>\n"
-    msg += f"🔴 Jami Sotildi: <b>{total_sold:,.0f} qop</b>\n"
-    msg += "═" * 24 + "\n\n"
-    msg += "<b>📦 Retseptlar Bo'yicha Real Qoldiq:</b>\n\n"
+    msg = f"🏭 <b>{b_name} — OSTATKA</b>\n"
+    msg += f"<i>(01.11.2026 dan boshlab)</i>\n"
+    msg += f"🟢 Ishlab chiqarildi: <b>{tot_p:,.0f} qop</b>\n\n"
 
-    real_closing_all = 0
+    total_real = 0
     for k in all_keys:
         if not k:
             continue
-        p_qty = prod_map.get(k, 0.0)
-        s_qty = sold_map.get(k, 0.0)
-        bal = max(0.0, p_qty - s_qty)
-        real_closing_all += bal
+        p_q = prod_map.get(k, 0.0)
+        s_q = sold_map.get(k, 0.0)
+        bal = max(0.0, p_q - s_q)
+        total_real += bal
+        icon = "🟢" if bal > 50 else ("🟡" if bal > 0 else "🔴")
+        msg += f"{icon} <b>{k.upper()}</b>:\n"
+        msg += f"   • Ishlab chiqarildi: +{p_q:,.0f} qop\n"
+        msg += f"   • Sotildi: -{s_q:,.0f} qop\n"
+        msg += f"   👉 <b>Qoldiq: {bal:,.0f} qop</b>\n\n"
 
-        status = "🟢" if bal > 50 else ("🟡" if bal > 0 else "🔴")
-        display_name = k.upper()
-        msg += f"{status} <b>{display_name}</b>:\n"
-        msg += f"   Ishlab chiqarildi: +{p_qty:,.0f} qop\n"
-        msg += f"   Sotildi: -{s_qty:,.0f} qop\n"
-        msg += f"   👉 <b>Haqiqiy Qoldiq: {bal:,.0f} qop</b>\n\n"
+    msg += f"📦 <b>Ombordagi Aniq Qoldiq: {total_real:,.0f} qop</b>"
+    return msg
 
-    msg += "═" * 24 + "\n"
-    msg += f"📦 <b>Ombordagi Umumiy Real Qoldiq: {real_closing_all:,.0f} qop</b>"
-
-    kb = {"inline_keyboard": [[{"text": "🔙 Boshqa korxonani tanlash", "callback_data": "branch_back"}]]}
-    return msg, kb
-
-# ----------------- 2. XOMASHYO VA BO'SH QOPLAR -----------------
-def get_materials_report():
-    url = f"{SUPABASE_URL}/rest/v1/materials?select=*,branches(name,city)&order=name.asc"
+# ----------------- 2. XOMASHYO -----------------
+def get_materials_report(chat_id: int):
+    b_id, b_name = get_current_branch(chat_id)
+    url = f"{SUPABASE_URL}/rest/v1/materials?select=*&branch_id=eq.{b_id}&order=name.asc"
     res = requests.get(url, headers=HEADERS, timeout=10)
     materials = res.json() if isinstance(res.json(), list) else []
 
     if not materials:
-        return "📦 Omborda xomashyo topilmadi."
+        return f"📦 <b>{b_name}</b> omborida materiallar mavjud emas."
 
-    msg = "📦 <b>Xomashyo & Bo'sh Qoplar Qoldig'i:</b>\n\n"
+    msg = f"📦 <b>{b_name} — Xomashyo & Qoplar:</b>\n\n"
     for m in materials:
         name = m.get("name") or "Material"
         stock = float(m.get("stock") or 0)
-        unit = m.get("unit") or "kg"
-        br = m.get("branches", {})
-        br_str = f" <i>({br.get('city')})</i>" if br else ""
+        unit = m.get("unit") or "dona"
         icon = "🟡" if "qop" in name.lower() else "🔹"
-        msg += f"{icon} <b>{name}</b>{br_str}: <b>{stock:,.0f} {unit}</b>\n"
+        msg += f"{icon} <b>{name}</b>: <b>{stock:,.0f} {unit}</b>\n"
     return msg
 
-# ----------------- 3. KASSA HISOBOTI -----------------
-def get_kassa_report():
-    url = f"{SUPABASE_URL}/rest/v1/kassa?select=*&order=date.asc"
+# ----------------- 3. KASSA -----------------
+def get_kassa_report(chat_id: int):
+    b_id, b_name = get_current_branch(chat_id)
+    url = f"{SUPABASE_URL}/rest/v1/kassa?select=*&branch_id=eq.{b_id}&order=date.asc"
     res = requests.get(url, headers=HEADERS, timeout=10)
-    all_rows = res.json() if isinstance(res.json(), list) else []
+    rows = res.json() if isinstance(res.json(), list) else []
 
-    kirim = sum(float(r.get("amount") or 0) for r in all_rows if str(r.get("type", "")).lower() == "kirim")
-    chiqim = sum(float(r.get("amount") or 0) for r in all_rows if str(r.get("type", "")).lower() == "chiqim")
+    kirim = sum(float(r.get("amount") or 0) for r in rows if str(r.get("type", "")).lower() == "kirim")
+    chiqim = sum(float(r.get("amount") or 0) for r in rows if str(r.get("type", "")).lower() == "chiqim")
     qoldiq = kirim - chiqim
 
     today_str = get_uz_today().strftime("%Y-%m-%d")
-    today_rows = [r for r in all_rows if str(r.get("date") or "")[:10] == today_str]
+    today_rows = [r for r in rows if str(r.get("date") or "")[:10] == today_str]
     t_k = sum(float(r.get("amount") or 0) for r in today_rows if str(r.get("type", "")).lower() == "kirim")
     t_ch = sum(float(r.get("amount") or 0) for r in today_rows if str(r.get("type", "")).lower() == "chiqim")
 
     msg = (
-        "💰 <b>KASSA & KUNLIK BALANS:</b>\n\n"
+        f"💰 <b>{b_name} — KASSA</b>\n\n"
         f"🟢 Jami Kirim: <b>+{kirim:,.0f} so'm</b>\n"
         f"🔴 Jami Chiqim: <b>-{chiqim:,.0f} so'm</b>\n"
-        f"💵 <b>Hozirgi Kassa Qoldig'i: {qoldiq:,.0f} so'm</b>\n"
-        "═" * 24 + "\n"
-        f"🗓 <b>Bugungi aylanma ({today_str}):</b>\n"
-        f"• Kirim: +{t_k:,.0f} so'm\n"
-        f"• Chiqim: -{t_ch:,.0f} so'm\n"
-        f"• Sof aylanma: {t_k - t_ch:+,.0f} so'm\n"
+        f"💵 <b>Sof Kassa Qoldig'i: {qoldiq:,.0f} so'm</b>\n\n"
+        f"🗓 <b>Bugun ({today_str}):</b>\n"
+        f"• Kirim: +{t_k:,.0f} | Chiqim: -{t_ch:,.0f}\n"
+        f"• Sof aylanma: <b>{t_k - t_ch:+,.0f} so'm</b>"
     )
     return msg
 
 # ----------------- 4. SOTUV DAFTARI -----------------
 def get_sales_report():
-    url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=*,customers(name)&is_ostatka=eq.false&order=id.desc&limit=10"
+    url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=*,customers(name)&is_ostatka=eq.false&order=id.desc&limit=8"
     res = requests.get(url, headers=HEADERS, timeout=10)
     sales = res.json() if isinstance(res.json(), list) else []
 
     if not sales:
-        return "📒 <i>Sotuvlar jurnali bo'sh.</i>"
+        return "📒 <i>Sotuvlar daftari bo'sh.</i>"
 
-    msg = "📒 <b>Oxirgi 10 ta Savdo Yozuvi:</b>\n\n"
+    msg = "📒 <b>Oxirgi Sotuvlar Jurnali:</b>\n\n"
     for i, s in enumerate(sales, 1):
         c_name = s.get("customers", {}).get("name") if s.get("customers") else "Mijoz"
         p_name = s.get("product_name") or "Mahsulot"
@@ -237,10 +230,83 @@ def get_sales_report():
         total = float(s.get("total") or 0)
         s_date = str(s.get("date") or "")[:10]
         msg += f"<b>{i}. {c_name}</b> ({s_date})\n"
-        msg += f"   📦 {p_name}: {qty} ta = <b>{total:,.0f} so'm</b>\n"
+        msg += f"   └ {p_name} × {qty} ta = <b>{total:,.0f} so'm</b>\n"
     return msg
 
-# ----------------- 5. QARZDOR MIJOZLAR (HUDUDLAR BO'YICHA) -----------------
+# ----------------- 5. ISHCHILAR OYLIGI (TARTIBLI & IXCHAM) -----------------
+def get_worker_months_keyboard():
+    months = ["2026-11", "2026-10", "2026-09"]
+    cur_m = get_uz_today().strftime("%Y-%m")
+    if cur_m not in months:
+        months.insert(0, cur_m)
+
+    buttons = []
+    for m in months:
+        buttons.append([{"text": f"📅 {m} Oyi Maoshlari", "callback_data": f"wm_{m}"}])
+
+    return "👨‍🔧 <b>Ishchilar Oyligi Arxivlari:</b>\nQaysi oyni ko'rmoqchisiz?", {"inline_keyboard": buttons}
+
+def get_worker_monthly_report(chat_id: int, m_str: str):
+    b_id, b_name = get_current_branch(chat_id)
+
+    w_res = requests.get(f"{SUPABASE_URL}/rest/v1/workers?select=*&branch_id=eq.{b_id}&order=name.asc", headers=HEADERS, timeout=10)
+    workers = w_res.json() if isinstance(w_res.json(), list) else []
+
+    sett_res = requests.get(f"{SUPABASE_URL}/rest/v1/worker_monthly_settlements?month=eq.{m_str}&branch_id=eq.{b_id}", headers=HEADERS, timeout=10)
+    settlements = sett_res.json() if isinstance(sett_res.json(), list) else []
+    sett_map = {s.get("worker_id"): s for s in settlements}
+
+    sal_res = requests.get(f"{SUPABASE_URL}/rest/v1/worker_salaries?select=*&branch_id=eq.{b_id}&date=gte.{m_str}-01&date=lte.{m_str}-31", headers=HEADERS, timeout=10)
+    salaries = sal_res.json() if isinstance(sal_res.json(), list) else []
+
+    p_res = requests.get(f"{SUPABASE_URL}/rest/v1/production?select=quantity&branch_id=eq.{b_id}&date=gte.{m_str}-01&date=lte.{m_str}-31", headers=HEADERS, timeout=10)
+    prods = p_res.json() if isinstance(p_res.json(), list) else []
+    factory_total_bags = sum(float(p.get("quantity") or 0) for p in prods)
+
+    if not workers:
+        return f"👨‍🔧 <b>{b_name}</b>da ishchilar ro'yxati topilmadi.", {"inline_keyboard": [[{"text": "🔙 Ortga", "callback_data": "wm_back"}]]}
+
+    tot_earned = 0
+    tot_advances = 0
+
+    msg = f"👨‍🔧 <b>{b_name}</b>\n"
+    msg += f"📅 <b>{m_str} Oyi Hisoboti:</b>\n"
+    msg += f"🏭 Ishlab chiqarildi: <b>{factory_total_bags:,.0f} qop</b>\n"
+    msg += "────────────────────────\n\n"
+
+    for i, w in enumerate(workers, 1):
+        w_id = w.get("id")
+        w_name = w.get("name") or "Ishchi"
+        is_piece = (w.get("salary_type") or "piecework") == "piecework"
+
+        sett = sett_map.get(w_id, {})
+        p_qty = float(sett.get("produced_qty") or 0)
+        rate = float(sett.get("rate") or w.get("rate") or 0)
+
+        total_salary = (p_qty * rate) if is_piece else rate
+        advances = sum(float(s.get("amount") or 0) for s in salaries if s.get("worker_id") == w_id)
+        rem_debt = total_salary - advances
+
+        tot_earned += total_salary
+        tot_advances += advances
+
+        msg += f"<b>{i}. {w_name}</b>\n"
+        if is_piece:
+            msg += f"   • Ishlagan: <b>{p_qty:,.0f} qop</b> ({rate:,.0f} so'mdan)\n"
+        msg += f"   • Maosh: <b>{total_salary:,.0f} so'm</b>\n"
+        msg += f"   • Avans: <b>-{advances:,.0f} so'm</b>\n"
+        msg += f"   👉 <b>Qoldiq: {rem_debt:,.0f} so'm</b>\n\n"
+
+    msg += "────────────────────────\n"
+    msg += f"📊 <b>OY YAKUNI:</b>\n"
+    msg += f"• Jami Maosh: <b>{tot_earned:,.0f} so'm</b>\n"
+    msg += f"• To'langan: <b>{tot_advances:,.0f} so'm</b>\n"
+    msg += f"• Korxona Qarzi: <b>{tot_earned - tot_advances:,.0f} so'm</b>"
+
+    kb = {"inline_keyboard": [[{"text": "🔙 Boshqa oyni tanlash", "callback_data": "wm_back"}]]}
+    return msg, kb
+
+# ----------------- 6. QARZDORLAR -----------------
 def get_debts_structure():
     url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=debt,customers(name,phone,folder)"
     res = requests.get(url, headers=HEADERS, timeout=10)
@@ -283,110 +349,8 @@ def get_region_keyboard():
     if row:
         buttons.append(row)
 
-    text = (
-        "👥 <b>Qarzdor Mijozlar Bo'limi</b>\n"
-        f"💵 Jami Umumiy Qarz: <b>{total_all:,.0f} so'm</b>\n\n"
-        "Hududni (papkani) tanlang:"
-    )
+    text = f"👥 <b>Qarzdor Mijozlar:</b>\n💵 Jami Qarz: <b>{total_all:,.0f} so'm</b>\n\nHududni tanlang:"
     return text, {"inline_keyboard": buttons}
-
-def get_clients_keyboard_by_region(region_name: str):
-    regions = get_debts_structure()
-    clients = regions.get(region_name, {})
-    buttons = []
-    reg_total = sum(c["debt"] for c in clients.values())
-
-    for c_name in sorted(clients.keys(), key=lambda s: s.lower()):
-        d_val = clients[c_name]["debt"]
-        buttons.append([{"text": f"👤 {c_name} — {d_val:,.0f}", "callback_data": f"debts_cl_{region_name}_{c_name}"}])
-
-    buttons.append([{"text": "🔙 Boshqa hududni tanlash", "callback_data": "debts_back_regions"}])
-    text = (
-        f"📁 <b>{region_name.upper()} hududi:</b>\n"
-        f"💵 Jami Qarz: <b>{reg_total:,.0f} so'm</b>\n\n"
-        "Mijozni tanlang:"
-    )
-    return text, {"inline_keyboard": buttons}
-
-# ----------------- 6. ISHCHILAR OYLIGI (OYLIK PAPKALAR VA HISOB-KITOB) -----------------
-def get_worker_months_keyboard():
-    # Mavjud oylar ro'yxati
-    months = ["2026-11", "2026-10", "2026-09"]
-    cur_m = get_uz_today().strftime("%Y-%m")
-    if cur_m not in months:
-        months.insert(0, cur_m)
-
-    buttons = []
-    for m in months:
-        buttons.append([{"text": f"📅 {m} Oyi Maoshlari", "callback_data": f"w_month_{m}"}])
-
-    text = "👨‍🔧 <b>Ishchilar Oyligi & Oylik Hisob-Kitob Arxivlari:</b>\nQaysi oy bo'yicha hisobotni ko'rmoqchisiz?"
-    return text, {"inline_keyboard": buttons}
-
-def get_worker_monthly_report(m_str: str):
-    # 1. Ishchilar
-    w_res = requests.get(f"{SUPABASE_URL}/rest/v1/workers?select=*&order=name.asc", headers=HEADERS, timeout=10)
-    workers = w_res.json() if isinstance(w_res.json(), list) else []
-
-    # 2. Oylik hisob-kitob qatorlari (worker_monthly_settlements)
-    sett_res = requests.get(f"{SUPABASE_URL}/rest/v1/worker_monthly_settlements?month=eq.{m_str}", headers=HEADERS, timeout=10)
-    settlements = sett_res.json() if isinstance(sett_res.json(), list) else []
-    sett_map = {s.get("worker_id"): s for s in settlements}
-
-    # 3. Shu oyda berilgan avanslar (worker_salaries)
-    sal_res = requests.get(f"{SUPABASE_URL}/rest/v1/worker_salaries?select=*&date=gte.{m_str}-01&date=lte.{m_str}-31", headers=HEADERS, timeout=10)
-    salaries = sal_res.json() if isinstance(sal_res.json(), list) else []
-
-    # 4. Korxonada shu oyda ishlab chiqarilgan qoplar jami
-    p_res = requests.get(f"{SUPABASE_URL}/rest/v1/production?select=quantity&date=gte.{m_str}-01&date=lte.{m_str}-31", headers=HEADERS, timeout=10)
-    prods = p_res.json() if isinstance(p_res.json(), list) else []
-    factory_total_bags = sum(float(p.get("quantity") or 0) for p in prods)
-
-    if not workers:
-        return "Tizimda ishchilar topilmadi.", None
-
-    tot_earned = 0
-    tot_advances = 0
-    tot_claimed_bags = 0
-
-    msg = f"👨‍🔧 <b>{m_str} OYI ISHCHILAR MAOSHI HISOBOTI:</b>\n"
-    msg += f"🏭 Korxonada ishlab chiqarildi: <b>{factory_total_bags:,.0f} qop</b>\n"
-    msg += "═" * 24 + "\n\n"
-
-    for i, w in enumerate(workers, 1):
-        w_id = w.get("id")
-        w_name = w.get("name") or "Ishchi"
-        w_role = w.get("role") or "Xodim"
-        is_piece = (w.get("salary_type") or "piecework") == "piecework"
-
-        sett = sett_map.get(w_id, {})
-        p_qty = float(sett.get("produced_qty") or 0)
-        rate = float(sett.get("rate") or w.get("rate") or 0)
-
-        total_salary = (p_qty * rate) if is_piece else rate
-        advances = sum(float(s.get("amount") or 0) for s in salaries if s.get("worker_id") == w_id)
-        rem_debt = total_salary - advances
-
-        tot_claimed_bags += p_qty
-        tot_earned += total_salary
-        tot_advances += advances
-
-        type_str = "Dona (Ishbay)" if is_piece else "Oylik"
-        msg += f"<b>{i}. {w_name}</b> ({w_role} - {type_str})\n"
-        if is_piece:
-            msg += f"   📦 Ishlagan qoplari: <b>{p_qty:,.0f} dona</b> ({rate:,.0f} so'm/dona)\n"
-        msg += f"   💵 Jami maoshi: <b>{total_salary:,.0f} so'm</b>\n"
-        msg += f"   💳 Olingan avanslar: <b>-{advances:,.0f} so'm</b>\n"
-        msg += f"   👉 <b>Qoldiq haq: {rem_debt:,.0f} so'm</b>\n"
-        msg += "────────────────────\n"
-
-    msg += f"\n📊 <b>{m_str} Oyi Jamlanmasi:</b>\n"
-    msg += f"• Ishchilarga hisoblandi: <b>{tot_earned:,.0f} so'm</b>\n"
-    msg += f"• To'langan avanslar: <b>{tot_advances:,.0f} so'm</b>\n"
-    msg += f"• Qolgan qarz: <b>{tot_earned - tot_advances:,.0f} so'm</b>\n"
-
-    kb = {"inline_keyboard": [[{"text": "🔙 Boshqa oyni tanlash", "callback_data": "w_month_back"}]]}
-    return msg, kb
 
 # ----------------- 7. BONUSLAR -----------------
 def get_bonus_report():
@@ -397,54 +361,55 @@ def get_bonus_report():
     total_qop = sum(float(b.get("quantity") or 0) for b in bonuses)
     total_sum = sum(float(b.get("total_bonus") or 0) for b in bonuses)
 
-    msg = (
-        "🎁 <b>Bonuslar Umumiy Tahlili:</b>\n\n"
-        f"🏷 Jami Bonusli Qoplar: <b>{total_qop:,.0f} dona</b>\n"
-        f"💸 Sarflangan Bonus Mablag'i: <b>{total_sum:,.0f} so'm</b>\n"
+    return (
+        "🎁 <b>Bonuslar Tahlili:</b>\n\n"
+        f"🏷 Bonusli Qoplar: <b>{total_qop:,.0f} dona</b>\n"
+        f"💸 Sarflangan Mablag': <b>{total_sum:,.0f} so'm</b>"
     )
-    return msg
 
-# ----------------- CALLBACK TUGMALARNI QAYTA ISHLASH -----------------
+# ----------------- CALLBACK TUGMALAR -----------------
 def handle_callback_query(callback_id: str, chat_id: int, message_id: int, data: str):
     try:
         requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": callback_id}, timeout=5)
     except:
         pass
 
-    # Korxona ostatkasi
-    if data == "branch_back":
-        text, kb = get_enterprises_report()
-        edit_message_text(chat_id, message_id, text, reply_markup=kb)
+    # Korxona tanlash
+    if data.startswith("set_br_"):
+        b_id = int(data.replace("set_br_", ""))
+        USER_ACTIVE_BRANCH[chat_id] = b_id
+        _, b_name = get_current_branch(chat_id)
+        edit_message_text(chat_id, message_id, f"✅ <b>Faol korxona tanlandi:</b>\n🏢 {b_name}\n\nEndi barcha ma'lumotlar faqat shu korxona bo'yicha ko'rsatiladi.")
         return
 
-    if data.startswith("branch_ost_"):
-        b_id = data.replace("branch_ost_", "")
-        text, kb = get_production_breakdown(b_id)
-        edit_message_text(chat_id, message_id, text, reply_markup=kb)
-        return
-
-    # Ishchilar oyligi oylik papkasi
-    if data == "w_month_back":
+    # Ishchilar oyligi
+    if data == "wm_back":
         text, kb = get_worker_months_keyboard()
         edit_message_text(chat_id, message_id, text, reply_markup=kb)
         return
 
-    if data.startswith("w_month_"):
-        m_str = data.replace("w_month_", "")
-        text, kb = get_worker_monthly_report(m_str)
+    if data.startswith("wm_"):
+        m_str = data.replace("wm_", "")
+        text, kb = get_worker_monthly_report(chat_id, m_str)
         edit_message_text(chat_id, message_id, text, reply_markup=kb)
         return
 
-    # Qarzdorlar bo'limi
+    # Qarzdorlar
     if data == "debts_back_regions":
         text, kb = get_region_keyboard()
         edit_message_text(chat_id, message_id, text, reply_markup=kb)
         return
 
     if data.startswith("debts_reg_"):
-        region_name = data.replace("debts_reg_", "")
-        text, kb = get_clients_keyboard_by_region(region_name)
-        edit_message_text(chat_id, message_id, text, reply_markup=kb)
+        reg = data.replace("debts_reg_", "")
+        regions = get_debts_structure()
+        clients = regions.get(reg, {})
+        buttons = []
+        for c_name in sorted(clients.keys(), key=lambda s: s.lower()):
+            d_val = clients[c_name]["debt"]
+            buttons.append([{"text": f"👤 {c_name} — {d_val:,.0f}", "callback_data": f"debts_cl_{reg}_{c_name}"}])
+        buttons.append([{"text": "🔙 Boshqa hudud", "callback_data": "debts_back_regions"}])
+        edit_message_text(chat_id, message_id, f"📁 <b>{reg} hududi:</b>\nMijozni tanlang:", reply_markup={"inline_keyboard": buttons})
         return
 
     if data.startswith("debts_cl_"):
@@ -457,54 +422,59 @@ def handle_callback_query(callback_id: str, chat_id: int, message_id: int, data:
             f"👤 <b>MIJOZ QARZ KARTASI:</b>\n\n"
             f"📌 Ism: <b>{cl_name}</b>\n"
             f"📍 Hudud: <b>{reg}</b>{phone_str}\n"
-            f"💰 Hozirgi qarzdorlik: <b>{cl_info.get('debt', 0):,.0f} so'm</b>\n"
+            f"💰 Qarz: <b>{cl_info.get('debt', 0):,.0f} so'm</b>"
         )
         kb = {"inline_keyboard": [[{"text": f"🔙 {reg} ro'yxatiga qaytish", "callback_data": f"debts_reg_{reg}"}]]}
         edit_message_text(chat_id, message_id, msg, reply_markup=kb)
         return
 
-# ----------------- ASOSIY XABARLARNI QAYTA ISHLASH -----------------
+# ----------------- ASOSIY BUYRUQLAR -----------------
 def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
     if not is_admin(user_id):
-        send_message(chat_id, f"Assalomu alaykum! Siz Memor ERP tizimida ro'yxatdan o'tmagansiz (Telegram ID: {user_id}).")
+        send_message(chat_id, f"Salom! Siz ro'yxatdan o'tmagansiz (Telegram ID: {user_id}).")
         return
 
     clean_text = text.strip()
+    _, b_name = get_current_branch(chat_id)
 
     if clean_text in ["/start", "start"]:
         send_message(
             chat_id,
             f"Assalomu alaykum, <b>{first_name}</b>!\n"
-            "Memor ERP boshqaruv tizimi faol. Kerakli bo'limni tanlang:",
+            f"🏢 Hozirgi tanlangan korxona: <b>{b_name}</b>\n\n"
+            "Kerakli bo'limni tanlang:",
             reply_markup=MAIN_KEYBOARD,
         )
 
-    elif clean_text == "🏭 Korxonalar & Ostatka":
-        msg, kb = get_enterprises_report()
-        send_message(chat_id, msg, reply_markup=kb)
+    elif clean_text == "🏢 Korxonani Almashtirish":
+        text_b, kb_b = get_branch_selector_keyboard()
+        send_message(chat_id, text_b, reply_markup=kb_b)
+
+    elif clean_text == "🏭 Ostatka (Retseptlar)":
+        send_message(chat_id, get_production_report(chat_id))
 
     elif clean_text == "📦 Xomashyo & Qoplar":
-        send_message(chat_id, get_materials_report())
+        send_message(chat_id, get_materials_report(chat_id))
 
     elif clean_text == "💰 Kassa Balansi":
-        send_message(chat_id, get_kassa_report())
+        send_message(chat_id, get_kassa_report(chat_id))
 
     elif clean_text == "📒 Sotuv Daftari":
         send_message(chat_id, get_sales_report())
+
+    elif clean_text == "👨‍🔧 Ishchilar Oyligi":
+        text_m, kb_m = get_worker_months_keyboard()
+        send_message(chat_id, text_m, reply_markup=kb_m)
 
     elif clean_text == "👥 Qarzdor Mijozlar":
         text_reg, kb_reg = get_region_keyboard()
         send_message(chat_id, text_reg, reply_markup=kb_reg)
 
-    elif clean_text == "👨‍🔧 Ishchilar Oyligi (Arxiv)":
-        text_m, kb_m = get_worker_months_keyboard()
-        send_message(chat_id, text_m, reply_markup=kb_m)
-
-    elif clean_text == "🎁 Bonuslar Tahlili":
+    elif clean_text == "🎁 Bonuslar":
         send_message(chat_id, get_bonus_report())
 
-    # Mijoz qidiruvi
     else:
+        # Mijoz qidiruvi
         try:
             query = clean_text.lower()
             regions = get_debts_structure()
@@ -518,10 +488,10 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
                 msg = f"🔍 <b>'{clean_text}' bo'yicha topildi:</b>\n\n"
                 for reg, name, info in matched:
                     phone = f"\n📞 Tel: {info['phone']}" if info['phone'] else ""
-                    msg += f"👤 <b>{name}</b> (📍 {reg}){phone}\n💰 Qarz: <b>{info['debt']:,.0f} so'm</b>\n────────────────\n"
+                    msg += f"👤 <b>{name}</b> (📍 {reg}){phone}\n💰 Qarz: <b>{info['debt']:,.0f} so'm</b>\n──────────────\n"
                 send_message(chat_id, msg)
             else:
-                send_message(chat_id, f"🔍 '{clean_text}' bo'yicha ma'lumot topilmadi.\nBo'limni tanlang:", reply_markup=MAIN_KEYBOARD)
+                send_message(chat_id, f"🔍 '{clean_text}' topilmadi.", reply_markup=MAIN_KEYBOARD)
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
@@ -531,7 +501,6 @@ def main():
         return
 
     threading.Thread(target=start_dummy_server, daemon=True).start()
-    logging.info(f"Render porti ({PORT}) ochiq saqlanmoqda...")
     logging.info("Memor ERP boti ishga tushdi!")
     offset = 0
 
@@ -554,4 +523,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
