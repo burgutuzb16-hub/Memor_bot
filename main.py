@@ -1,5 +1,7 @@
+
 import os
 import time
+import re
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -25,7 +27,6 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-# O'zbekiston vaqti (UTC+5)
 UZ_TZ = timezone(timedelta(hours=5))
 
 def get_uz_today() -> datetime:
@@ -85,50 +86,59 @@ def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup=Non
     except Exception as e:
         logging.error(f"Xabarni tahrirlashda xatolik: {e}")
 
-# ----------------- INLINE TUGMALARNI GENERATSIYA QILISH -----------------
-def generate_date_picker_keyboard(section_prefix: str, days_back: int = 7):
+# ----------------- SAHIFALANUVCHI SANA KALENDARI -----------------
+def generate_date_picker_keyboard(section_prefix: str, page: int = 0):
+    """
+    page=0 bo'lsa: Bugun, Kecha va oldingi kunlar
+    page=1 bo'lsa: 7 kundan keyingi o'tmishdagi kunlar (masalan, 12-oktabr va h.k.)
+    """
     buttons = []
     
+    # 1. Asosiy umumiy tugma
     if section_prefix == "prod":
         buttons.append([{"text": "📊 Umumiy Ostatka Zanjiri", "callback_data": "prod_all"}])
     elif section_prefix == "kassa":
-        buttons.append([{"text": "💵 Umumiy Kassa Balansi", "callback_data": "kassa_all"}])
+        buttons.append([{"text": "💵 Hozirgi Umumiy Balans", "callback_data": "kassa_all"}])
     elif section_prefix == "sale":
         buttons.append([{"text": "📒 Oxirgi 10 ta Savdo", "callback_data": "sale_all"}])
 
     today = get_uz_today()
-    yesterday = today - timedelta(days=1)
+    start_offset = page * 8
     
-    t_str = today.strftime("%Y-%m-%d")
-    y_str = yesterday.strftime("%Y-%m-%d")
-    
-    buttons.append([
-        {"text": f"🟢 Bugun ({today.strftime('%d.%m')})", "callback_data": f"{section_prefix}_{t_str}"},
-        {"text": f"🟡 Kecha ({yesterday.strftime('%d.%m')})", "callback_data": f"{section_prefix}_{y_str}"}
-    ])
-
-    row = []
-    for i in range(2, days_back + 1):
+    # Kunlarni chiqarish
+    current_batch = []
+    for i in range(start_offset, start_offset + 8):
         day = today - timedelta(days=i)
         d_str = day.strftime("%Y-%m-%d")
-        d_label = day.strftime("%d-%b")
-        row.append({"text": f"🗓 {d_label}", "callback_data": f"{section_prefix}_{d_str}"})
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
+        
+        if i == 0:
+            label = f"🟢 Bugun ({day.strftime('%d.%m')})"
+        elif i == 1:
+            label = f"🟡 Kecha ({day.strftime('%d.%m')})"
+        else:
+            label = f"🗓 {day.strftime('%d-%b')}"
+
+        current_batch.append({"text": label, "callback_data": f"{section_prefix}_{d_str}_{page}"})
+
+    # Tugmalarni 2 tadan qilib joylash
+    for j in range(0, len(current_batch), 2):
+        buttons.append(current_batch[j:j+2])
+
+    # Varaqlash tugmalari (Oldingi / Keyingi kunlar)
+    nav_row = []
+    if page > 0:
+        nav_row.append({"text": "➡️ Yangiroq kunlar", "callback_data": f"{section_prefix}_page_{page - 1}"})
+    nav_row.append({"text": "⬅️ Oldingi kunlar", "callback_data": f"{section_prefix}_page_{page + 1}"})
+    buttons.append(nav_row)
 
     return {"inline_keyboard": buttons}
 
-# ----------------- SANANI FILTRLASH YORDAMCHISI -----------------
-def check_row_date(row: dict, target_date: str) -> bool:
-    """Qatorda date yoki created_at ustunlaridan biri berilgan sanaga to'g'ri keladimi tekshiradi"""
+def extract_row_date(row: dict) -> str:
     for key in ["date", "created_at", "sana"]:
         val = str(row.get(key) or "")
-        if val.startswith(target_date):
-            return True
-    return False
+        if val:
+            return val[:10]
+    return ""
 
 # ----------------- 1. OSTATKA / ISHLAB CHIQARISH -----------------
 def get_production_report(date_str: str = None):
@@ -143,15 +153,14 @@ def get_production_report(date_str: str = None):
         jami_sotildi = sum(float(x.get("quantity") or 0) for x in s_data)
         qoldiq_qop = max(0, jami_ishlab_chiqarildi - jami_sotildi)
 
-        msg = (
+        return (
             "🏭 <b>Umumiy Ostatka (Ishlab chiqarish balansi):</b>\n\n"
             f"🟢 Jami Ishlab Chiqarildi: <b>{jami_ishlab_chiqarildi:,.0f} qop</b>\n"
             f"🔴 Jami Sotildi / Chiqim: <b>{jami_sotildi:,.0f} qop</b>\n"
             f"📦 <b>Ombordagi Haqiqiy Qoldiq: {qoldiq_qop:,.0f} qop</b>"
         )
-        return msg
 
-    filtered_prods = [x for x in p_data if check_row_date(x, date_str)]
+    filtered_prods = [x for x in p_data if extract_row_date(x) == date_str]
 
     if not filtered_prods:
         return f"🏭 <b>{date_str}</b> sanasida ishlab chiqarish ma'lumotlari topilmadi."
@@ -170,7 +179,7 @@ def get_production_report(date_str: str = None):
 
     return msg
 
-# ----------------- 2. KASSA -----------------
+# ----------------- 2. KASSA (KUNLIK VA REAL TARIXIY QOLDIQ) -----------------
 def get_kassa_report(date_str: str = None):
     url = f"{SUPABASE_URL}/rest/v1/kassa?select=*"
     res = requests.get(url, headers=HEADERS, timeout=10)
@@ -181,31 +190,38 @@ def get_kassa_report(date_str: str = None):
         chiqim = sum(float(r.get("amount") or 0) for r in all_rows if str(r.get("type", "")).lower() == "chiqim")
         qoldiq = kirim - chiqim
 
-        msg = (
+        return (
             "💰 <b>Umumiy Kassa Balansi:</b>\n\n"
             f"🟢 Jami Kirim: <b>{kirim:,.0f} so'm</b>\n"
             f"🔴 Jami Chiqim: <b>{chiqim:,.0f} so'm</b>\n"
             f"💵 <b>Hozirgi Sof Qoldiq: {qoldiq:,.0f} so'm</b>"
         )
-        return msg
 
-    filtered_rows = [r for r in all_rows if check_row_date(r, date_str)]
+    # 1. Faqat shu kundagi amallar
+    day_rows = [r for r in all_rows if extract_row_date(r) == date_str]
+    kunlik_kirim = sum(float(r.get("amount") or 0) for r in day_rows if str(r.get("type", "")).lower() == "kirim")
+    kunlik_chiqim = sum(float(r.get("amount") or 0) for r in day_rows if str(r.get("type", "")).lower() == "chiqim")
+    kunlik_aylanma = kunlik_kirim - kunlik_chiqim
 
-    kirim = sum(float(r.get("amount") or 0) for r in filtered_rows if str(r.get("type", "")).lower() == "kirim")
-    chiqim = sum(float(r.get("amount") or 0) for r in filtered_rows if str(r.get("type", "")).lower() == "chiqim")
-    sof = kirim - chiqim
+    # 2. Ushbu kun oxirigacha (<= date_str) bo'lgan barcha tarixiy qoldiq (Haqiqiy kassa qoldig'i)
+    cumulative_rows = [r for r in all_rows if extract_row_date(r) and extract_row_date(r) <= date_str]
+    tot_kirim = sum(float(r.get("amount") or 0) for r in cumulative_rows if str(r.get("type", "")).lower() == "kirim")
+    tot_chiqim = sum(float(r.get("amount") or 0) for r in cumulative_rows if str(r.get("type", "")).lower() == "chiqim")
+    real_kun_oxiri_qoldiq = tot_kirim - tot_chiqim
 
     msg = f"💰 <b>{date_str} Kassa Hisoboti:</b>\n\n"
-    msg += f"🟢 Kirim: <b>+{kirim:,.0f} so'm</b>\n"
-    msg += f"🔴 Chiqim: <b>-{chiqim:,.0f} so'm</b>\n"
-    msg += f"💵 Kunlik sof qoldiq: <b>{sof:,.0f} so'm</b>\n"
+    msg += f"🟢 Bugungi Kirim: <b>+{kunlik_kirim:,.0f} so'm</b>\n"
+    msg += f"🔴 Bugungi Chiqim: <b>-{kunlik_chiqim:,.0f} so'm</b>\n"
+    msg += f"⚖️ Kunlik sof aylanma: <b>{kunlik_aylanma:+,.0f} so'm</b>\n"
+    msg += f"💵 <b>Kun yakunidagi kassa qoldig'i: {real_kun_oxiri_qoldiq:,.0f} so'm</b>\n"
     msg += "═" * 22 + "\n\n"
 
-    if not filtered_rows:
-        msg += "<i>Ushbu sanada kassa harakatlari amalga oshirilmagan.</i>"
+    if not day_rows:
+        msg += "<i>Ushbu sanada kassa amallari bo'lmagan.</i>"
         return msg
 
-    for i, r in enumerate(filtered_rows, 1):
+    msg += "<b>Shu kungi amallar:</b>\n"
+    for i, r in enumerate(day_rows, 1):
         is_kirim = str(r.get("type", "")).lower() == "kirim"
         t = "🟢 Kirim" if is_kirim else "🔴 Chiqim"
         comm = r.get("comment") or r.get("category") or "Izohsiz"
@@ -223,7 +239,7 @@ def get_sales_report(date_str: str = None):
         sales = all_sales[:10]
         title = "📒 <b>Oxirgi 10 ta Savdo Jurnali:</b>"
     else:
-        sales = [s for s in all_sales if check_row_date(s, date_str)]
+        sales = [s for s in all_sales if extract_row_date(s) == date_str]
         title = f"🗓 <b>{date_str} Sanasidagi Sotuvlar:</b>"
 
     if not sales:
@@ -272,31 +288,48 @@ def handle_callback_query(callback_id: str, chat_id: int, message_id: int, data:
     except:
         pass
 
-    if data.startswith("prod_"):
-        val = data.replace("prod_", "")
-        date_param = None if val == "all" else val
+    # Sahifalash (Paginatsiya) bosilganda: masalan, kassa_page_1
+    if "_page_" in data:
+        prefix, page_str = data.split("_page_")
+        page = int(page_str)
+        kb = generate_date_picker_keyboard(prefix, page)
+        
+        if prefix == "prod":
+            text = "🏭 <b>Ostatka bo'limi:</b> Kerakli sanani tanlang:"
+        elif prefix == "kassa":
+            text = "💰 <b>Kassa bo'limi:</b> Kerakli sanani tanlang:"
+        else:
+            text = "📒 <b>Sotuv Daftari:</b> Kerakli sanani tanlang:"
+            
+        edit_message_text(chat_id, message_id, text, reply_markup=kb)
+        return
+
+    # Sana yoki Umumiy qoldiq bosilganda
+    parts = data.split("_")
+    prefix = parts[0]
+    val = parts[1]
+    page = int(parts[2]) if len(parts) > 2 else 0
+
+    date_param = None if val == "all" else val
+    
+    if prefix == "prod":
         text = get_production_report(date_param)
-        edit_message_text(chat_id, message_id, text, reply_markup=generate_date_picker_keyboard("prod"))
-
-    elif data.startswith("kassa_"):
-        val = data.replace("kassa_", "")
-        date_param = None if val == "all" else val
+    elif prefix == "kassa":
         text = get_kassa_report(date_param)
-        edit_message_text(chat_id, message_id, text, reply_markup=generate_date_picker_keyboard("kassa"))
-
-    elif data.startswith("sale_"):
-        val = data.replace("sale_", "")
-        date_param = None if val == "all" else val
+    else:
         text = get_sales_report(date_param)
-        edit_message_text(chat_id, message_id, text, reply_markup=generate_date_picker_keyboard("sale"))
 
-# ----------------- XABARLARNI QAYTA ISHLASH -----------------
+    edit_message_text(chat_id, message_id, text, reply_markup=generate_date_picker_keyboard(prefix, page))
+
+# ----------------- ASOSIY XABARLARNI QAYTA ISHLASH -----------------
 def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
     if not is_admin(user_id):
         send_message(chat_id, f"Salom! Siz tizimda ro'yxatdan o'tmagansiz (Telegram ID: {user_id}).")
         return
 
-    if text in ["/start", "start"]:
+    clean_text = text.strip()
+
+    if clean_text in ["/start", "start"]:
         send_message(
             chat_id,
             f"Assalomu alaykum, <b>{first_name}</b>!\n"
@@ -305,7 +338,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
             reply_markup=MAIN_KEYBOARD,
         )
 
-    elif text == "📦 Xomashyo & Qoplar":
+    elif clean_text == "📦 Xomashyo & Qoplar":
         try:
             url = f"{SUPABASE_URL}/rest/v1/materials?select=name,stock,unit&order=name.asc"
             res = requests.get(url, headers=HEADERS, timeout=10)
@@ -323,22 +356,22 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    elif text == "🏭 Ostatka (Ishlab chiqarish)":
+    elif clean_text == "🏭 Ostatka (Ishlab chiqarish)":
         msg = get_production_report(None)
-        kb = generate_date_picker_keyboard("prod")
+        kb = generate_date_picker_keyboard("prod", 0)
         send_message(chat_id, msg, reply_markup=kb)
 
-    elif text == "💰 Kassa Balansi":
+    elif clean_text == "💰 Kassa Balansi":
         msg = get_kassa_report(None)
-        kb = generate_date_picker_keyboard("kassa")
+        kb = generate_date_picker_keyboard("kassa", 0)
         send_message(chat_id, msg, reply_markup=kb)
 
-    elif text == "📒 Sotuv Daftari":
+    elif clean_text == "📒 Sotuv Daftari":
         msg = get_sales_report(None)
-        kb = generate_date_picker_keyboard("sale")
+        kb = generate_date_picker_keyboard("sale", 0)
         send_message(chat_id, msg, reply_markup=kb)
 
-    elif text == "👥 Qarzdor Mijozlar":
+    elif clean_text == "👥 Qarzdor Mijozlar":
         try:
             active_debts = get_debts_dict()
             if not active_debts:
@@ -376,7 +409,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    elif text == "👨‍🔧 Ishchilar Oyligi":
+    elif clean_text == "👨‍🔧 Ishchilar Oyligi":
         try:
             url = f"{SUPABASE_URL}/rest/v1/worker_salaries?select=date,amount,comment,workers(name,role)&order=id.desc&limit=8"
             res = requests.get(url, headers=HEADERS, timeout=10)
@@ -395,7 +428,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    elif text == "🎁 Bonuslar Tahlili":
+    elif clean_text == "🎁 Bonuslar Tahlili":
         try:
             url = f"{SUPABASE_URL}/rest/v1/production?select=quantity,total_bonus,has_bonus&has_bonus=eq.true"
             res = requests.get(url, headers=HEADERS, timeout=10)
@@ -413,14 +446,27 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
+    # Sana yozilgan bo'lsa (Masalan: 2026-10-12)
+    elif re.match(r"^\d{4}-\d{2}-\d{2}$", clean_text) or re.match(r"^\d{2}\.\d{2}\.\d{4}$", clean_text):
+        if "." in clean_text:
+            p = clean_text.split(".")
+            d_str = f"{p[2]}-{p[1]}-{p[0]}"
+        else:
+            d_str = clean_text
+
+        k_msg = get_kassa_report(d_str)
+        s_msg = get_sales_report(d_str)
+        send_message(chat_id, f"{k_msg}\n\n{s_msg}")
+
+    # Mijoz qidiruvi
     else:
         try:
-            query = text.strip().lower()
+            query = clean_text.lower()
             active_debts = get_debts_dict()
             matched = {k: v for k, v in active_debts.items() if query in k.lower() or query in v["phone"]}
 
             if matched:
-                msg = f"🔍 <b>'{text}' bo'yicha qidiruv:</b>\n\n"
+                msg = f"🔍 <b>'{clean_text}' bo'yicha qidiruv:</b>\n\n"
                 for name, info in matched.items():
                     phone = f"\n📞 Tel: {info['phone']}" if info['phone'] else ""
                     msg += (
@@ -432,7 +478,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
             else:
                 send_message(
                     chat_id,
-                    f"🔍 '{text}' bo'yicha ma'lumot topilmadi.\nKerakli bo'limni tanlang:",
+                    f"🔍 '{clean_text}' bo'yicha ma'lumot topilmadi.\nKerakli bo'limni tanlang:",
                     reply_markup=MAIN_KEYBOARD,
                 )
         except Exception as e:
