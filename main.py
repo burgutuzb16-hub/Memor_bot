@@ -1,5 +1,6 @@
 import os
 import logging
+import requests
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -8,28 +9,23 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from supabase import create_client, Client
 
-# Loglarni sozlash
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-# Render'dagi Environment Variables'dan ma'lumotlarni o'qib olish
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ADMIN_IDS = os.getenv("TELEGRAM_ADMIN_USER_IDS", "")
 
-# Supabase mijozini yaratish
-supabase: Client = None
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-else:
-    logging.error("Supabase URL yoki KEY topilmadi!")
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json"
+}
 
-# Bosh menyu tugmalari
 MAIN_KEYBOARD = [
     ["📦 Ombor Qoldig'i", "💰 Kassa Qoldig'i"],
     ["👥 Mijozlar Qarzi", "📊 Kunlik Sotuvlar"],
@@ -45,13 +41,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not is_admin(user_id):
         await update.message.reply_text(
-            f"Salom, {update.effective_user.first_name}! Siz tizimda ro'yxatdan o'tmagansiz (ID: {user_id}).",
+            f"Salom! Siz tizimda ro'yxatdan o'tmagansiz (Sizning Telegram ID: {user_id})."
         )
         return
 
     await update.message.reply_text(
         f"Assalomu alaykum, {update.effective_user.first_name}!\n"
-        "Memor ERP tizimi boshqaruv botiga xush kelibsiz.",
+        "Memor ERP boshqaruv botiga xush kelibsiz.",
         reply_markup=reply_markup,
     )
 
@@ -60,36 +56,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if not is_admin(user_id):
-        await update.message.reply_text("Sizga bu ma'lumotlarni ko'rish uchun ruxsat berilmagan.")
+        await update.message.reply_text("Sizga bu ma'lumotlarni ko'rish uchun ruxsat yo'q.")
         return
 
-    if not supabase:
-        await update.message.reply_text("Bazaga ulanishda xatolik mavjud!")
-        return
-
-    # 1. Ombor qoldig'i
+    # 1. Ombor Qoldig'i
     if text == "📦 Ombor Qoldig'i":
         try:
-            res = supabase.table("materials").select("name, stock, unit").execute()
-            materials = res.data or []
-            if not materials:
+            url = f"{SUPABASE_URL}/rest/v1/materials?select=name,stock,unit"
+            res = requests.get(url, headers=HEADERS, timeout=10)
+            materials = res.json()
+            
+            if not materials or not isinstance(materials, list):
                 await update.message.reply_text("Omborda mahsulotlar topilmadi.")
                 return
-            
+
             msg = "📦 <b>Ombordagi mavjud qoldiqlar:</b>\n\n"
             for m in materials:
-                msg += f"• <b>{m['name']}</b>: {m['stock']} {m.get('unit', '')}\n"
+                msg += f"• <b>{m.get('name')}</b>: {m.get('stock')} {m.get('unit', '')}\n"
             await update.message.reply_html(msg)
         except Exception as e:
-            await update.message.reply_text(f"Xatolik yuz berdi: {e}")
+            await update.message.reply_text(f"Xatolik: {e}")
 
-    # 2. Kassa qoldig'i
+    # 2. Kassa Qoldig'i
     elif text == "💰 Kassa Qoldig'i":
         try:
-            res = supabase.table("kassa").select("type, amount").execute()
-            rows = res.data or []
-            kirim = sum(float(r["amount"]) for r in rows if r["type"] == "kirim")
-            chiqim = sum(float(r["amount"]) for r in rows if r["type"] == "chiqim")
+            url = f"{SUPABASE_URL}/rest/v1/kassa?select=type,amount"
+            res = requests.get(url, headers=HEADERS, timeout=10)
+            rows = res.json()
+            
+            if not isinstance(rows, list):
+                rows = []
+
+            kirim = sum(float(r.get("amount") or 0) for r in rows if r.get("type") == "kirim")
+            chiqim = sum(float(r.get("amount") or 0) for r in rows if r.get("type") == "chiqim")
             qoldiq = kirim - chiqim
 
             msg = (
@@ -100,47 +99,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await update.message.reply_html(msg)
         except Exception as e:
-            await update.message.reply_text(f"Xatolik yuz berdi: {e}")
+            await update.message.reply_text(f"Xatolik: {e}")
 
-    # 3. Mijozlar qarzdorligi
+    # 3. Mijozlar Qarzi
     elif text == "👥 Mijozlar Qarzi":
         try:
-            res = supabase.table("customer_sales").select("customer_id, debt, customers(name)").execute()
-            rows = res.data or []
+            url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=debt,customers(name)"
+            res = requests.get(url, headers=HEADERS, timeout=10)
+            rows = res.json()
             
-            customer_debts = {}
-            for r in rows:
-                c_name = r.get("customers", {}).get("name", "Noma'lum") if r.get("customers") else "Noma'lum"
-                debt = float(r.get("debt") or 0)
-                customer_debts[c_name] = customer_debts.get(c_name, 0) + debt
+            if not isinstance(rows, list):
+                rows = []
 
-            active_debts = {k: v for k, v in customer_debts.items() if v > 0}
+            debts = {}
+            for r in rows:
+                c_name = r.get("customers", {}).get("name") if r.get("customers") else "Noma'lum"
+                val = float(r.get("debt") or 0)
+                debts[c_name] = debts.get(c_name, 0) + val
+
+            active_debts = {k: v for k, v in debts.items() if v > 0}
             if not active_debts:
-                await update.message.reply_text("Hozirda qarzdor mijozlar mavjud emas.")
+                await update.message.reply_text("Qarzdor mijozlar yo'q.")
                 return
 
-            msg = "👥 <b>Qarzdor mijozlar ro'yxati:</b>\n\n"
+            msg = "👥 <b>Qarzdor mijozlar:</b>\n\n"
             for name, debt in sorted(active_debts.items(), key=lambda x: x[1], reverse=True):
                 msg += f"• <b>{name}</b>: {debt:,.0f} so'm\n"
             await update.message.reply_html(msg)
         except Exception as e:
-            await update.message.reply_text(f"Xatolik yuz berdi: {e}")
+            await update.message.reply_text(f"Xatolik: {e}")
 
-    # 4. Kunlik sotuvlar
+    # 4. Kunlik Sotuvlar
     elif text == "📊 Kunlik Sotuvlar":
         try:
-            res = supabase.table("customer_sales").select("product_name, quantity, total, date").order("id", desc=True).limit(10).execute()
-            sales = res.data or []
-            if not sales:
+            url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=product_name,quantity,total,date&order=id.desc&limit=10"
+            res = requests.get(url, headers=HEADERS, timeout=10)
+            sales = res.json()
+
+            if not sales or not isinstance(sales, list):
                 await update.message.reply_text("Sotuvlar topilmadi.")
                 return
 
             msg = "📊 <b>Oxirgi 10 ta savdo amaliyoti:</b>\n\n"
             for s in sales:
-                msg += f"• [{s.get('date')}] <b>{s['product_name']}</b> - {s['quantity']} ta ({float(s['total']):,.0f} so'm)\n"
+                msg += f"• [{s.get('date')}] <b>{s.get('product_name')}</b> - {s.get('quantity')} ta ({float(s.get('total') or 0):,.0f} so'm)\n"
             await update.message.reply_html(msg)
         except Exception as e:
-            await update.message.reply_text(f"Xatolik yuz berdi: {e}")
+            await update.message.reply_text(f"Xatolik: {e}")
 
 def main():
     if not BOT_TOKEN:
@@ -148,7 +153,6 @@ def main():
         return
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
