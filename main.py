@@ -1,4 +1,3 @@
-
 import os
 import time
 import re
@@ -86,15 +85,16 @@ def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup=Non
     except Exception as e:
         logging.error(f"Xabarni tahrirlashda xatolik: {e}")
 
-# ----------------- SAHIFALANUVCHI SANA KALENDARI -----------------
+def extract_row_date(row: dict) -> str:
+    for key in ["date", "created_at", "sana"]:
+        val = str(row.get(key) or "")
+        if val:
+            return val[:10]
+    return ""
+
+# ----------------- SAHIFALANUVCHI KALENDAR (OSTATKA, KASSA, SOTUV) -----------------
 def generate_date_picker_keyboard(section_prefix: str, page: int = 0):
-    """
-    page=0 bo'lsa: Bugun, Kecha va oldingi kunlar
-    page=1 bo'lsa: 7 kundan keyingi o'tmishdagi kunlar (masalan, 12-oktabr va h.k.)
-    """
     buttons = []
-    
-    # 1. Asosiy umumiy tugma
     if section_prefix == "prod":
         buttons.append([{"text": "📊 Umumiy Ostatka Zanjiri", "callback_data": "prod_all"}])
     elif section_prefix == "kassa":
@@ -105,44 +105,32 @@ def generate_date_picker_keyboard(section_prefix: str, page: int = 0):
     today = get_uz_today()
     start_offset = page * 8
     
-    # Kunlarni chiqarish
     current_batch = []
     for i in range(start_offset, start_offset + 8):
         day = today - timedelta(days=i)
         d_str = day.strftime("%Y-%m-%d")
-        
         if i == 0:
             label = f"🟢 Bugun ({day.strftime('%d.%m')})"
         elif i == 1:
             label = f"🟡 Kecha ({day.strftime('%d.%m')})"
         else:
             label = f"🗓 {day.strftime('%d-%b')}"
-
         current_batch.append({"text": label, "callback_data": f"{section_prefix}_{d_str}_{page}"})
 
-    # Tugmalarni 2 tadan qilib joylash
     for j in range(0, len(current_batch), 2):
         buttons.append(current_batch[j:j+2])
 
-    # Varaqlash tugmalari (Oldingi / Keyingi kunlar)
     nav_row = []
     if page > 0:
-        nav_row.append({"text": "➡️ Yangiroq kunlar", "callback_data": f"{section_prefix}_page_{page - 1}"})
+        nav_row.append({"text": "➡️ Yangiroq", "callback_data": f"{section_prefix}_page_{page - 1}"})
     nav_row.append({"text": "⬅️ Oldingi kunlar", "callback_data": f"{section_prefix}_page_{page + 1}"})
     buttons.append(nav_row)
 
     return {"inline_keyboard": buttons}
 
-def extract_row_date(row: dict) -> str:
-    for key in ["date", "created_at", "sana"]:
-        val = str(row.get(key) or "")
-        if val:
-            return val[:10]
-    return ""
-
-# ----------------- 1. OSTATKA / ISHLAB CHIQARISH -----------------
+# ----------------- 1. OSTATKA (ISHLAB CHIQARISH) -----------------
 def get_production_report(date_str: str = None):
-    p_res = requests.get(f"{SUPABASE_URL}/rest/v1/production?select=*", headers=HEADERS, timeout=10)
+    p_res = requests.get(f"{SUPABASE_URL}/rest/v1/production?select=*&order=id.desc", headers=HEADERS, timeout=10)
     s_res = requests.get(f"{SUPABASE_URL}/rest/v1/customer_sales?select=*&is_ostatka=eq.false", headers=HEADERS, timeout=10)
 
     p_data = p_res.json() if isinstance(p_res.json(), list) else []
@@ -171,15 +159,23 @@ def get_production_report(date_str: str = None):
     msg += "═" * 22 + "\n\n"
 
     for i, p in enumerate(filtered_prods, 1):
-        name = p.get("product_name") or p.get("name") or "Mahsulot"
+        # Mahsulot nomini aniqlash (barcha mumkin bo'lgan ustunlar bo'yicha)
+        name = (
+            p.get("product_name") 
+            or p.get("name") 
+            or p.get("recipe_name") 
+            or p.get("material_name") 
+            or p.get("comment") 
+            or "Noma'lum Mahsulot"
+        )
         qty = float(p.get("quantity") or 0)
         bonus_mark = " 🎁 (Bonusli)" if p.get("has_bonus") else ""
         shift = f" [Smena: {p.get('shift')}]" if p.get("shift") else ""
-        msg += f"{i}. <b>{name}</b>: {qty:,.0f} qop{bonus_mark}{shift}\n"
+        msg += f"{i}. 📦 <b>{name}</b>: <b>{qty:,.0f} qop</b>{bonus_mark}{shift}\n"
 
     return msg
 
-# ----------------- 2. KASSA (KUNLIK VA REAL TARIXIY QOLDIQ) -----------------
+# ----------------- 2. KASSA HISOBOTI -----------------
 def get_kassa_report(date_str: str = None):
     url = f"{SUPABASE_URL}/rest/v1/kassa?select=*"
     res = requests.get(url, headers=HEADERS, timeout=10)
@@ -197,13 +193,11 @@ def get_kassa_report(date_str: str = None):
             f"💵 <b>Hozirgi Sof Qoldiq: {qoldiq:,.0f} so'm</b>"
         )
 
-    # 1. Faqat shu kundagi amallar
     day_rows = [r for r in all_rows if extract_row_date(r) == date_str]
     kunlik_kirim = sum(float(r.get("amount") or 0) for r in day_rows if str(r.get("type", "")).lower() == "kirim")
     kunlik_chiqim = sum(float(r.get("amount") or 0) for r in day_rows if str(r.get("type", "")).lower() == "chiqim")
     kunlik_aylanma = kunlik_kirim - kunlik_chiqim
 
-    # 2. Ushbu kun oxirigacha (<= date_str) bo'lgan barcha tarixiy qoldiq (Haqiqiy kassa qoldig'i)
     cumulative_rows = [r for r in all_rows if extract_row_date(r) and extract_row_date(r) <= date_str]
     tot_kirim = sum(float(r.get("amount") or 0) for r in cumulative_rows if str(r.get("type", "")).lower() == "kirim")
     tot_chiqim = sum(float(r.get("amount") or 0) for r in cumulative_rows if str(r.get("type", "")).lower() == "chiqim")
@@ -260,26 +254,119 @@ def get_sales_report(date_str: str = None):
 
     return msg
 
-# ----------------- 4. QARZDORLAR -----------------
-def get_debts_dict():
-    url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=debt,customers(name,phone)"
+# ----------------- 4. INTERAKTIV QARZDORLAR TUZILMASI (TUMAN / SHAHAR BO'YICHA) -----------------
+def get_debts_structure():
+    """
+    Tumanlar, mijozlar va ularning qarzlarini daraxt ko'rinishida yig'ish:
+    {
+      "Qarshi": {
+         "Alimardon": {"debt": 1425000, "phone": "+998..."},
+         ...
+      }
+    }
+    """
+    url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=debt,customers(id,name,phone,folder,region,city)"
     res = requests.get(url, headers=HEADERS, timeout=10)
     rows = res.json() if isinstance(res.json(), list) else []
 
-    customers_data = {}
+    regions = {}
     for r in rows:
         c = r.get("customers")
         if not c:
             continue
         c_name = (c.get("name") or "Noma'lum").strip()
-        c_phone = (c.get("phone") or "").strip()
+        # Tuman nomi: folder, region yoki city ustunidan olinadi
+        folder = (c.get("folder") or c.get("region") or c.get("city") or "Boshqa hududlar").strip().title()
+        phone = (c.get("phone") or "").strip()
         debt_val = float(r.get("debt") or 0)
 
-        if c_name not in customers_data:
-            customers_data[c_name] = {"phone": c_phone, "total_debt": 0.0}
-        customers_data[c_name]["total_debt"] += debt_val
+        if folder not in regions:
+            regions[folder] = {}
+        if c_name not in regions[folder]:
+            regions[folder][c_name] = {"debt": 0.0, "phone": phone}
+        regions[folder][c_name]["debt"] += debt_val
 
-    return {k: v for k, v in customers_data.items() if v["total_debt"] > 0}
+    # Faqat 0 dan katta qarzi borlarni qoldirish
+    active_regions = {}
+    for f, clients in regions.items():
+        act_clients = {name: data for name, data in clients.items() if data["debt"] > 0}
+        if act_clients:
+            active_regions[f] = act_clients
+
+    return active_regions
+
+def get_region_keyboard():
+    """Tuman/Shaharlarni tanlash menyusi"""
+    regions = get_debts_structure()
+    buttons = []
+    
+    total_all = sum(sum(c["debt"] for c in cl.values()) for cl in regions.values())
+
+    # Har bir tumanga alohida tugma
+    row = []
+    for reg_name in sorted(regions.keys()):
+        reg_total = sum(c["debt"] for c in regions[reg_name].values())
+        row.append({"text": f"📁 {reg_name}", "callback_data": f"debts_reg_{reg_name}"})
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    text = (
+        "👥 <b>Qarzdorlar bo'limi</b>\n"
+        f"💵 Jami umumiy qarz: <b>{total_all:,.0f} so'm</b>\n\n"
+        "Kerakli tuman yoki shaharni tanlang:"
+    )
+    return text, {"inline_keyboard": buttons}
+
+def get_clients_keyboard_by_region(region_name: str):
+    """Tanlangan tuman ichidagi qarzdor mijozlar tugmalari"""
+    regions = get_debts_structure()
+    clients = regions.get(region_name, {})
+
+    buttons = []
+    reg_total = sum(c["debt"] for c in clients.values())
+
+    # Mijozlarni Alifbo bo'yicha saralash
+    sorted_clients = sorted(clients.keys(), key=lambda s: s.lower())
+    
+    for c_name in sorted_clients:
+        d_val = clients[c_name]["debt"]
+        # Tugma ustiga ism va qisqa summa chiqariladi
+        buttons.append([{"text": f"👤 {c_name} — {d_val:,.0f}", "callback_data": f"debts_cl_{region_name}_{c_name}"}])
+
+    buttons.append([{"text": "🔙 Boshqa tumanni tanlash", "callback_data": "debts_back_regions"}])
+
+    text = (
+        f"📁 <b>{region_name.upper()} hududi qarzdorlari:</b>\n"
+        f"💵 Hudud bo'yicha jami: <b>{reg_total:,.0f} so'm</b>\n\n"
+        "Batafsil ma'lumot olish uchun mijozni tanlang:"
+    )
+    return text, {"inline_keyboard": buttons}
+
+def get_single_client_debt_card(region_name: str, client_name: str):
+    """Alohida bitta mijozning qarz kartochkasi"""
+    regions = get_debts_structure()
+    client_info = regions.get(region_name, {}).get(client_name)
+
+    if not client_info:
+        return "Mijoz ma'lumotlari topilmadi.", {"inline_keyboard": [[{"text": "🔙 Ortga", "callback_data": f"debts_reg_{region_name}"}]]}
+
+    phone_str = f"\n📞 Telefon: <b>{client_info['phone']}</b>" if client_info['phone'] else ""
+    
+    msg = (
+        f"👤 <b>MIJOZ QARZ HISOBOTI:</b>\n\n"
+        f"📌 Ism: <b>{client_name}</b>\n"
+        f"📍 Tuman/Shahar: <b>{region_name}</b>{phone_str}\n"
+        f"🔴 Hozirgi qarzdorlik: <b>{client_info['debt']:,.0f} so'm</b>\n"
+    )
+
+    kb = {"inline_keyboard": [
+        [{"text": f"🔙 {region_name} ro'yxatiga qaytish", "callback_data": f"debts_reg_{region_name}"}],
+        [{"text": "📁 Barcha tumanlar", "callback_data": "debts_back_regions"}]
+    ]}
+    return msg, kb
 
 # ----------------- CALLBACK TUGMALARNI QAYTA ISHLASH -----------------
 def handle_callback_query(callback_id: str, chat_id: int, message_id: int, data: str):
@@ -288,30 +375,49 @@ def handle_callback_query(callback_id: str, chat_id: int, message_id: int, data:
     except:
         pass
 
-    # Sahifalash (Paginatsiya) bosilganda: masalan, kassa_page_1
+    # 1. Qarzdorlar: Tumanlar bosh menyusiga qaytish
+    if data == "debts_back_regions":
+        text, kb = get_region_keyboard()
+        edit_message_text(chat_id, message_id, text, reply_markup=kb)
+        return
+
+    # 2. Qarzdorlar: Muayyan tuman tanlanganda
+    if data.startswith("debts_reg_"):
+        region_name = data.replace("debts_reg_", "")
+        text, kb = get_clients_keyboard_by_region(region_name)
+        edit_message_text(chat_id, message_id, text, reply_markup=kb)
+        return
+
+    # 3. Qarzdorlar: Muayyan bitta mijoz tanlanganda
+    if data.startswith("debts_cl_"):
+        parts = data.replace("debts_cl_", "").split("_", 1)
+        region_name = parts[0]
+        client_name = parts[1]
+        text, kb = get_single_client_debt_card(region_name, client_name)
+        edit_message_text(chat_id, message_id, text, reply_markup=kb)
+        return
+
+    # 4. Kalendar sahifalash (Paginatsiya)
     if "_page_" in data:
         prefix, page_str = data.split("_page_")
         page = int(page_str)
         kb = generate_date_picker_keyboard(prefix, page)
-        
         if prefix == "prod":
             text = "🏭 <b>Ostatka bo'limi:</b> Kerakli sanani tanlang:"
         elif prefix == "kassa":
             text = "💰 <b>Kassa bo'limi:</b> Kerakli sanani tanlang:"
         else:
             text = "📒 <b>Sotuv Daftari:</b> Kerakli sanani tanlang:"
-            
         edit_message_text(chat_id, message_id, text, reply_markup=kb)
         return
 
-    # Sana yoki Umumiy qoldiq bosilganda
+    # 5. Ostatka / Kassa / Sotuv sana hisoboti
     parts = data.split("_")
     prefix = parts[0]
     val = parts[1]
     page = int(parts[2]) if len(parts) > 2 else 0
-
     date_param = None if val == "all" else val
-    
+
     if prefix == "prod":
         text = get_production_report(date_param)
     elif prefix == "kassa":
@@ -371,41 +477,11 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         kb = generate_date_picker_keyboard("sale", 0)
         send_message(chat_id, msg, reply_markup=kb)
 
+    # 👥 QARZDORLAR: TUMAN/SHAHAR BO'YICHA MENYU CHIQARISH
     elif clean_text == "👥 Qarzdor Mijozlar":
         try:
-            active_debts = get_debts_dict()
-            if not active_debts:
-                send_message(chat_id, "✅ Qarzdor mijozlar mavjud emas!")
-                return
-
-            total_sum = sum(v["total_debt"] for v in active_debts.values())
-            sorted_names = sorted(active_debts.keys(), key=lambda s: s.lower())
-
-            msg = f"👥 <b>QARZDOR MIJOZLAR RO'YXATI</b>\n"
-            msg += f"💵 Jami qarz: <b>{total_sum:,.0f} so'm</b>\n"
-            msg += f"👤 Qarzdorlar soni: <b>{len(sorted_names)} ta</b>\n"
-            msg += "═" * 22 + "\n\n"
-
-            current_char = ""
-            count = 1
-
-            for name in sorted_names:
-                first_char = name[0].upper()
-                if first_char != current_char:
-                    current_char = first_char
-                    msg += f"\n🔤 <b>— [ {current_char} ] —</b>\n"
-
-                info = active_debts[name]
-                debt_str = f"{info['total_debt']:,.0f} so'm"
-                phone_str = f" <i>({info['phone']})</i>" if info['phone'] else ""
-
-                msg += (
-                    f"<b>{count}. {name}</b>{phone_str}\n"
-                    f"    └── 🔴 Qarz: <b>{debt_str}</b>\n"
-                )
-                count += 1
-
-            send_message(chat_id, msg)
+            msg, kb = get_region_keyboard()
+            send_message(chat_id, msg, reply_markup=kb)
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
@@ -456,22 +532,28 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
 
         k_msg = get_kassa_report(d_str)
         s_msg = get_sales_report(d_str)
-        send_message(chat_id, f"{k_msg}\n\n{s_msg}")
+        p_msg = get_production_report(d_str)
+        send_message(chat_id, f"{k_msg}\n\n{s_msg}\n\n{p_msg}")
 
     # Mijoz qidiruvi
     else:
         try:
             query = clean_text.lower()
-            active_debts = get_debts_dict()
-            matched = {k: v for k, v in active_debts.items() if query in k.lower() or query in v["phone"]}
+            regions = get_debts_structure()
+            matched = []
+
+            for reg_name, cl_dict in regions.items():
+                for c_name, c_info in cl_dict.items():
+                    if query in c_name.lower() or query in c_info["phone"]:
+                        matched.append((reg_name, c_name, c_info))
 
             if matched:
-                msg = f"🔍 <b>'{clean_text}' bo'yicha qidiruv:</b>\n\n"
-                for name, info in matched.items():
+                msg = f"🔍 <b>'{clean_text}' bo'yicha qidiruv natijalari:</b>\n\n"
+                for reg, name, info in matched:
                     phone = f"\n📞 Tel: {info['phone']}" if info['phone'] else ""
                     msg += (
-                        f"👤 <b>{name}</b>{phone}\n"
-                        f"💰 Qarzdorlik: <b>{info['total_debt']:,.0f} so'm</b>\n"
+                        f"👤 <b>{name}</b> (📍 {reg}){phone}\n"
+                        f"💰 Qarzdorlik: <b>{info['debt']:,.0f} so'm</b>\n"
                         f"────────────────────\n"
                     )
                 send_message(chat_id, msg)
@@ -491,7 +573,7 @@ def main():
 
     threading.Thread(target=start_dummy_server, daemon=True).start()
     logging.info(f"Render veb-porti ({PORT}) ochiq saqlanmoqda...")
-    logging.info("Memor ERP boti ishga tushdi!")
+    logging.info("Memor ERP boti yangilandi!")
     offset = 0
 
     while True:
