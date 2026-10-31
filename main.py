@@ -1,6 +1,8 @@
 import os
 import time
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 
 logging.basicConfig(
@@ -12,6 +14,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ADMIN_IDS = os.getenv("TELEGRAM_ADMIN_USER_IDS", "")
+PORT = int(os.getenv("PORT", 10000))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -29,6 +32,21 @@ MAIN_KEYBOARD = {
     "resize_keyboard": True,
 }
 
+# 1. Render portini ochiq ushlab turish uchun yengil veb-server
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive and running!")
+
+    def log_message(self, format, *args):
+        pass  # Ortiqcha log chiqarmaslik uchun
+
+def start_dummy_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    server.serve_forever()
+
+# 2. Telegram mantiqi
 def is_admin(user_id: int) -> bool:
     admin_list = [i.strip() for i in ADMIN_IDS.split(",") if i.strip()]
     return str(user_id) in admin_list
@@ -58,7 +76,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
             reply_markup=MAIN_KEYBOARD,
         )
 
-    # 1. Ombor Qoldig'i
+    # Ombor
     elif text == "📦 Ombor Qoldig'i":
         try:
             url = f"{SUPABASE_URL}/rest/v1/materials?select=name,stock,unit"
@@ -75,7 +93,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    # 2. Kassa Qoldig'i
+    # Kassa
     elif text == "💰 Kassa Qoldig'i":
         try:
             url = f"{SUPABASE_URL}/rest/v1/kassa?select=type,amount"
@@ -98,7 +116,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    # 3. Mijozlar Qarzi
+    # Qarzdorlik
     elif text == "👥 Mijozlar Qarzi":
         try:
             url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=debt,customers(name)"
@@ -125,7 +143,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    # 4. Kunlik Sotuvlar
+    # Sotuvlar
     elif text == "📊 Kunlik Sotuvlar":
         try:
             url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=product_name,quantity,total,date&order=id.desc&limit=10"
@@ -147,7 +165,11 @@ def main():
         logging.error("BOT_TOKEN topilmadi!")
         return
 
-    logging.info("Bot Render'da muvaffaqiyatli ishga tushmoqda...")
+    # Render uchun alohida oqimda veb-portni yoqib qo'yamiz
+    threading.Thread(target=start_dummy_server, daemon=True).start()
+    logging.info(f"Render veb-porti ({PORT}) ochiq saqlanmoqda...")
+
+    logging.info("Bot muvaffaqiyatli ishga tushdi!")
     offset = 0
 
     while True:
