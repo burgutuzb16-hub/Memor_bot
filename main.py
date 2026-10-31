@@ -24,7 +24,6 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-# Saytdagi barcha 7 ta asosiy bo'lim tugmalari
 MAIN_KEYBOARD = {
     "keyboard": [
         [{"text": "📦 Xomashyo & Qoplar"}, {"text": "🏭 Ostatka (Ishlab chiqarish)"}],
@@ -35,12 +34,12 @@ MAIN_KEYBOARD = {
     "resize_keyboard": True,
 }
 
-# Render veb-porti ochiq turishi uchun mini-server
+# Render porti uchun mini server
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Memor ERP Bot is running perfectly!")
+        self.wfile.write(b"Memor ERP Bot is running!")
 
     def log_message(self, format, *args):
         pass
@@ -75,8 +74,8 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         send_message(
             chat_id,
             f"Assalomu alaykum, <b>{first_name}</b>!\n"
-            "<b>Memor ERP</b> to'liq boshqaruv paneliga xush kelibsiz.\n"
-            "Kerakli bo'limni tanlang:",
+            "Memor ERP boshqaruv paneliga xush kelibsiz.\n"
+            "Bo'limni tanlang:",
             reply_markup=MAIN_KEYBOARD,
         )
 
@@ -99,7 +98,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    # 2. OSTATKA & ISHLAB CHIQARISH
+    # 2. OSTATKA
     elif text == "🏭 Ostatka (Ishlab chiqarish)":
         try:
             p_res = requests.get(f"{SUPABASE_URL}/rest/v1/production?select=quantity", headers=HEADERS, timeout=10)
@@ -113,7 +112,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
             qoldiq_qop = max(0, jami_ishlab_chiqarildi - jami_sotildi)
 
             msg = (
-                "🏭 <b>Ostatka (Tayyor Mahsulot Zanjiri):</b>\n\n"
+                "🏭 <b>Ostatka (Zanjirli Balans):</b>\n\n"
                 f"🟢 Jami Ishlab Chiqarildi: <b>{jami_ishlab_chiqarildi:,.0f} qop</b>\n"
                 f"🔴 Jami Sotildi / Chiqim: <b>{jami_sotildi:,.0f} qop</b>\n"
                 f"📦 <b>Ombordagi Haqiqiy Qoldiq: {qoldiq_qop:,.0f} qop</b>"
@@ -122,7 +121,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    # 3. KASSA BALANSI
+    # 3. KASSA
     elif text == "💰 Kassa Balansi":
         try:
             url = f"{SUPABASE_URL}/rest/v1/kassa?select=type,amount"
@@ -146,7 +145,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
     # 4. SOTUV DAFTARI
     elif text == "📒 Sotuv Daftari":
         try:
-            url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=product_name,quantity,price,total,paid,date,customers(name)&is_ostatka=eq.false&order=id.desc&limit=8"
+            url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=product_name,quantity,total,paid,date,customers(name)&is_ostatka=eq.false&order=id.desc&limit=8"
             res = requests.get(url, headers=HEADERS, timeout=10)
             sales = res.json() if isinstance(res.json(), list) else []
 
@@ -167,29 +166,62 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    # 5. QARZDOR MIJOZLAR
+    # 5. QARZDOR MIJOZLAR (TUMAN/SHAHAR VA ALIFBO TARTIBIDA)
     elif text == "👥 Qarzdor Mijozlar":
         try:
-            url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=debt,customers(name,phone)"
+            # Mijozlar va ularning qarzlari hamda qaysi tumandagi (folder) ekanligini olamiz
+            url = f"{SUPABASE_URL}/rest/v1/customer_sales?select=debt,customers(name,folder,phone)"
             res = requests.get(url, headers=HEADERS, timeout=10)
             rows = res.json() if isinstance(res.json(), list) else []
 
-            debts = {}
+            # Tumanlar bo'yicha mijozlarning qarzlarini jamlash
+            # Format: { "Kasbi": { "Alimardon": 500000, "Sanjar": 120000 }, "Koson": { ... } }
+            regions = {}
+            total_debt_all = 0
+
             for r in rows:
                 c = r.get("customers")
-                c_name = c.get("name") if c else "Noma'lum"
-                val = float(r.get("debt") or 0)
-                debts[c_name] = debts.get(c_name, 0) + val
+                if not c:
+                    continue
+                
+                c_name = c.get("name", "Noma'lum").strip()
+                folder = (c.get("folder") or "Umumiy").strip()
+                debt_val = float(r.get("debt") or 0)
 
-            active = {k: v for k, v in debts.items() if v > 0}
-            if not active:
-                send_message(chat_id, "Hozirda qarzdor mijozlar yo'q.")
+                if folder not in regions:
+                    regions[folder] = {}
+
+                regions[folder][c_name] = regions[folder].get(c_name, 0) + debt_val
+
+            # Faqat qarzi bor (0 dan katta) mijozlarni saralash
+            filtered_regions = {}
+            for f_name, clients in regions.items():
+                active_clients = {name: d for name, d in clients.items() if d > 0}
+                if active_clients:
+                    filtered_regions[f_name] = active_clients
+                    total_debt_all += sum(active_clients.values())
+
+            if not filtered_regions:
+                send_message(chat_id, "✅ Hozirda qarzdor mijozlar mavjud emas!")
                 return
 
-            jami_qarz = sum(active.values())
-            msg = f"👥 <b>Qarzdor Mijozlar Ro'yxati:</b>\n(Jami qarz: <b>{jami_qarz:,.0f} so'm</b>)\n\n"
-            for name, debt in sorted(active.items(), key=lambda x: x[1], reverse=True):
-                msg += f"• <b>{name}</b>: {debt:,.0f} so'm\n"
+            msg = f"👥 <b>QARZDORLAR (HUDUDLAR VA ALIFBO BO'YICHA):</b>\n"
+            msg += f"💵 <b>Umumiy qarz: {total_debt_all:,.0f} so'm</b>\n\n"
+
+            # Tumanlarni alifbo tartibida chiqarish
+            for f_name in sorted(filtered_regions.keys()):
+                clients_in_folder = filtered_regions[f_name]
+                folder_total = sum(clients_in_folder.values())
+
+                msg += f"📁 <b>{f_name.upper()}</b> (Jami: {folder_total:,.0f} so'm):\n"
+                
+                # Tumandagi mijozlarni Alifbo (A-Z) tartibida saralash
+                for c_name in sorted(clients_in_folder.keys(), key=lambda s: s.lower()):
+                    d_amount = clients_in_folder[c_name]
+                    msg += f"  ▫️ {c_name}: <b>{d_amount:,.0f} so'm</b>\n"
+                
+                msg += "\n"
+
             send_message(chat_id, msg)
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
@@ -214,7 +246,7 @@ def handle_text(chat_id: int, user_id: int, text: str, first_name: str):
         except Exception as e:
             send_message(chat_id, f"Xatolik: {e}")
 
-    # 7. BONUSLAR TAHLILI
+    # 7. BONUSLAR
     elif text == "🎁 Bonuslar Tahlili":
         try:
             url = f"{SUPABASE_URL}/rest/v1/production?select=quantity,total_bonus,has_bonus&has_bonus=eq.true"
